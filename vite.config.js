@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+mport { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
@@ -10,6 +10,9 @@ export default defineConfig({
   preview: {
     port: parseInt(process.env.PORT || "4173"),
     host: "0.0.0.0",
-    allowedHosts: "all",
+    allowedHosts: [
+      "funding-arb-bot-production-7c82.up.railway.app",
+      ".railway.app",
+      "localhost",
+    ],
   },
-});
