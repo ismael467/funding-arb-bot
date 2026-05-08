@@ -474,4 +474,3 @@ export default function RankingTab({ config }) {
     </div>
   );
 }
-
