@@ -75,12 +75,14 @@ async function fetchAster() {
   const tickerMap = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
 
-  const premArr = Array.isArray(prem) && prem.length > 0 ? prem : (Array.isArray(tickers) ? tickers : []);
+  const premMap = {};
+  (Array.isArray(prem) ? prem : []).forEach(p => { if (p.symbol) premMap[p.symbol] = p; });
+
   const map = {};
-  premArr.forEach(p => {
-    if (!p.symbol) return;
-    const sym   = p.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
-    const t     = tickerMap[p.symbol] || p;
+  (Array.isArray(tickers) ? tickers : []).forEach(t => {
+    if (!t.symbol) return;
+    const sym   = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
+    const p     = premMap[t.symbol] || {};
     const price = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
     if (!price) return;
     const bid = parseFloat(t.bidPrice || price * 0.999);
@@ -118,7 +120,7 @@ async function fetchBackpack() {
         dex: "Backpack",
         fundingApr: parseFloat(fr.fundingRate || fr.lastFundingRate || 0) * 3 * 365 * 100,
         price,
-        vol24h: parseFloat(t.quoteVolume || 0),
+        vol24h: parseFloat(t.quoteVolume) || parseFloat(t.volume || 0) * parseFloat(t.lastPrice || 0),
         oi:     0,
         spreadPct: 0,
       };
