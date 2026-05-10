@@ -81,19 +81,31 @@ async function fetchAster() {
   const map = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => {
     if (!t.symbol) return;
-    const sym   = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
-    const p     = premMap[t.symbol] || {};
-    const price = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
-    if (!price) return;
-    const bid = parseFloat(t.bidPrice || price * 0.999);
-    const ask = parseFloat(t.askPrice || price * 1.001);
+    const sym     = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
+    const p       = premMap[t.symbol] || {};
+    const markPx  = parseFloat(p.markPrice  || p.p || t.lastPrice || t.weightedAvgPrice || 0);
+    const indexPx = parseFloat(p.indexPrice || p.indexPx || 0);
+    if (!markPx) return;
+
+    // lastFundingRate is the real per-period rate; fundingRate / interestRate fields
+    // on Binance-fork DEXes contain only the fixed interest component (0.0001),
+    // so we avoid them as fallback. When lastFundingRate is absent, estimate from
+    // mark-index premium (clamp to ±0.75% per period, Binance default cap).
+    const lastRate = parseFloat(p.lastFundingRate || 0);
+    const premium  = indexPx > 0 ? (markPx - indexPx) / indexPx : 0;
+    const fundingRate = lastRate !== 0
+      ? lastRate
+      : Math.max(-0.0075, Math.min(0.0075, premium));
+
+    const bid = parseFloat(t.bidPrice || markPx * 0.999);
+    const ask = parseFloat(t.askPrice || markPx * 1.001);
     map[sym] = {
       dex: "Aster",
-      fundingApr: parseFloat(p.lastFundingRate || p.fundingRate || p.r || 0) * 3 * 365 * 100,
-      price,
+      fundingApr: fundingRate * 3 * 365 * 100,
+      price:     markPx,
       vol24h:    parseFloat(t.quoteVolume || 0),
       oi:        0,
-      spreadPct: price > 0 ? (ask - bid) / price : 0,
+      spreadPct: markPx > 0 ? (ask - bid) / markPx : 0,
     };
   });
   return map;
