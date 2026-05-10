@@ -74,18 +74,20 @@ async function fetchAster() {
   ]);
   const tickerMap = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
+
+  const premArr = Array.isArray(prem) && prem.length > 0 ? prem : (Array.isArray(tickers) ? tickers : []);
   const map = {};
-  (Array.isArray(prem) ? prem : []).forEach(p => {
+  premArr.forEach(p => {
     if (!p.symbol) return;
-    const sym   = p.symbol.replace("USDT", "").replace("BUSD", "");
-    const price = parseFloat(p.markPrice || p.p || 0);
+    const sym   = p.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
+    const t     = tickerMap[p.symbol] || p;
+    const price = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
     if (!price) return;
-    const t   = tickerMap[p.symbol] || {};
     const bid = parseFloat(t.bidPrice || price * 0.999);
     const ask = parseFloat(t.askPrice || price * 1.001);
     map[sym] = {
       dex: "Aster",
-      fundingApr: parseFloat(p.lastFundingRate || p.r || 0) * 3 * 365 * 100,
+      fundingApr: parseFloat(p.lastFundingRate || p.fundingRate || p.r || 0) * 3 * 365 * 100,
       price,
       vol24h:    parseFloat(t.quoteVolume || 0),
       oi:        0,
@@ -97,28 +99,27 @@ async function fetchAster() {
 
 async function fetchBackpack() {
   try {
-    const [markRes, tickerRes] = await Promise.all([
-      proxyGet(`${BACK_API}/markPrices`),
+    const [tickerRes, fundingRes] = await Promise.all([
       proxyGet(`${BACK_API}/tickers`),
+      proxyGet(`${BACK_API}/fundingRates`).catch(() => []),
     ]);
-    const tickerMap = {};
-    (Array.isArray(tickerRes) ? tickerRes : []).forEach(t => {
-      if (t.symbol) tickerMap[t.symbol] = t;
+    const fundingMap = {};
+    (Array.isArray(fundingRes) ? fundingRes : []).forEach(f => {
+      if (f.symbol) fundingMap[f.symbol] = f;
     });
-    const markets = Array.isArray(markRes) ? markRes : [];
     const map = {};
-    markets.forEach(m => {
-      if (!m.symbol?.includes("PERP")) return;
-      const sym   = m.symbol.replace("_USDC_PERP", "").replace("_USDT_PERP", "");
-      const price = parseFloat(m.markPrice || 0);
+    (Array.isArray(tickerRes) ? tickerRes : []).forEach(t => {
+      if (!t.symbol?.endsWith("_PERP")) return;
+      const sym   = t.symbol.replace(/_USDC_PERP$/, "").replace(/_USDT_PERP$/, "");
+      const price = parseFloat(t.lastPrice || 0);
       if (!price) return;
-      const ticker = tickerMap[m.symbol] || {};
+      const fr = fundingMap[t.symbol] || {};
       map[sym] = {
         dex: "Backpack",
-        fundingApr: parseFloat(m.fundingRate || 0) * 3 * 365 * 100,
+        fundingApr: parseFloat(fr.fundingRate || fr.lastFundingRate || 0) * 3 * 365 * 100,
         price,
-        vol24h: parseFloat(ticker.volume || ticker.quoteVolume || ticker.volumeUsd || 0),
-        oi:     parseFloat(m.openInterest || 0) * price,
+        vol24h: parseFloat(t.quoteVolume || 0),
+        oi:     0,
         spreadPct: 0,
       };
     });
