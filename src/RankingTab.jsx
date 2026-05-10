@@ -27,8 +27,12 @@ function calcScore({ spreadApr, spreadPct, vol, oi }) {
   const fs = Math.min(Math.abs(spreadApr) / 100, 1) * 40;
   const ss = Math.max(0, 1 - spreadPct / 0.005) * 20;
   const vs = Math.min(Math.log10(Math.max(vol, 1)) / 8, 1) * 25;
-  const os = Math.min(Math.log10(Math.max(oi, 1)) / 8, 1) * 15;
-  return Math.min(100, Math.max(0, Math.round(fs + ss + vs + os)));
+  if (oi > 0) {
+    const os = Math.min(Math.log10(oi) / 8, 1) * 15;
+    return Math.min(100, Math.max(0, Math.round(fs + ss + vs + os)));
+  }
+  // OI unknown: rescale remaining 85 pts to 100 so missing data doesn't penalize
+  return Math.min(100, Math.max(0, Math.round((fs + ss + vs) * 100 / 85)));
 }
 
 async function proxyGet(url) {
@@ -68,20 +72,15 @@ async function fetchHL() {
 }
 
 async function fetchAster() {
-  const [prem, tickers, oiRes] = await Promise.all([
+  const [prem, tickers] = await Promise.all([
     proxyGet(`${ASTER_API}/fapi/v1/premiumIndex`),
     proxyGet(`${ASTER_API}/fapi/v1/ticker/24hr`),
-    proxyGet(`${ASTER_API}/fapi/v1/openInterest`).catch(() => []),
   ]);
   const tickerMap = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
 
   const premMap = {};
   (Array.isArray(prem) ? prem : []).forEach(p => { if (p.symbol) premMap[p.symbol] = p; });
-
-  // openInterest endpoint returns [{symbol, openInterest, time}] on Binance-fork DEXes
-  const oiMap = {};
-  (Array.isArray(oiRes) ? oiRes : []).forEach(o => { if (o.symbol) oiMap[o.symbol] = o; });
 
   const map = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => {
@@ -101,11 +100,7 @@ async function fetchAster() {
       ? lastRate
       : Math.max(-0.0075, Math.min(0.0075, premium));
 
-    const oi = parseFloat(
-      oiMap[t.symbol]?.openInterest ||  // batch OI endpoint
-      p.openInterest ||                  // premiumIndex field (some forks)
-      0
-    ) * markPx;
+    const oi = parseFloat(p.openInterest || 0) * markPx;
 
     const bid = parseFloat(t.bidPrice || markPx * 0.999);
     const ask = parseFloat(t.askPrice || markPx * 1.001);
