@@ -249,9 +249,10 @@ export default function RankingTab({ config }) {
 
       setMaps({ hlMap, asterMap, backMap });
 
-      // Debug: ver vol de algunos tokens en Backpack
-      const backSample = Object.entries(backMap).slice(0, 3).map(([sym, d]) => `${sym}:$${(d.vol24h/1000).toFixed(0)}K`).join(", ");
-      setDebugInfo(`Backpack sample vol: ${backSample}`);
+      const hlSample   = ["BTC","ETH","SOL"].map(s => hlMap[s]   ? `${s}:$${(hlMap[s].vol24h/1e6).toFixed(1)}M fr${hlMap[s].fundingApr.toFixed(2)}%`   : `${s}:miss`).join(" ");
+      const backSample = ["BTC","ETH","SOL"].map(s => backMap[s] ? `${s}:$${(backMap[s].vol24h/1e6).toFixed(1)}M fr${backMap[s].fundingApr.toFixed(2)}%` : `${s}:miss`).join(" ");
+      const asterCount = Object.keys(asterMap).length;
+      setDebugInfo(`HL: ${hlSample} | BP: ${backSample} | Aster:${asterCount}`);
 
       setDexStatus({
         HL:       Object.keys(hlMap).length,
