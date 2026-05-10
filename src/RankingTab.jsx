@@ -68,9 +68,10 @@ async function fetchHL() {
 }
 
 async function fetchAster() {
-  const [prem, tickers] = await Promise.all([
+  const [prem, tickers, oiRes] = await Promise.all([
     proxyGet(`${ASTER_API}/fapi/v1/premiumIndex`),
     proxyGet(`${ASTER_API}/fapi/v1/ticker/24hr`),
+    proxyGet(`${ASTER_API}/fapi/v1/openInterest`).catch(() => []),
   ]);
   const tickerMap = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
@@ -78,33 +79,42 @@ async function fetchAster() {
   const premMap = {};
   (Array.isArray(prem) ? prem : []).forEach(p => { if (p.symbol) premMap[p.symbol] = p; });
 
+  // openInterest endpoint returns [{symbol, openInterest, time}] on Binance-fork DEXes
+  const oiMap = {};
+  (Array.isArray(oiRes) ? oiRes : []).forEach(o => { if (o.symbol) oiMap[o.symbol] = o; });
+
   const map = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => {
     if (!t.symbol) return;
     const sym     = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
     const p       = premMap[t.symbol] || {};
-    const markPx  = parseFloat(p.markPrice  || p.p || t.lastPrice || t.weightedAvgPrice || 0);
+    const markPx  = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
     const indexPx = parseFloat(p.indexPrice || p.indexPx || 0);
     if (!markPx) return;
 
-    // lastFundingRate is the real per-period rate; fundingRate / interestRate fields
-    // on Binance-fork DEXes contain only the fixed interest component (0.0001),
-    // so we avoid them as fallback. When lastFundingRate is absent, estimate from
-    // mark-index premium (clamp to ±0.75% per period, Binance default cap).
-    const lastRate = parseFloat(p.lastFundingRate || 0);
-    const premium  = indexPx > 0 ? (markPx - indexPx) / indexPx : 0;
+    // Aster pays funding every 4 h (6×/day). Use lastFundingRate (actual paid rate);
+    // avoid fundingRate/interestRate fields which are the fixed 0.0001 interest component.
+    // When lastFundingRate is absent, estimate from mark-index premium (±0.75% cap).
+    const lastRate   = parseFloat(p.lastFundingRate || 0);
+    const premium    = indexPx > 0 ? (markPx - indexPx) / indexPx : 0;
     const fundingRate = lastRate !== 0
       ? lastRate
       : Math.max(-0.0075, Math.min(0.0075, premium));
+
+    const oi = parseFloat(
+      oiMap[t.symbol]?.openInterest ||  // batch OI endpoint
+      p.openInterest ||                  // premiumIndex field (some forks)
+      0
+    ) * markPx;
 
     const bid = parseFloat(t.bidPrice || markPx * 0.999);
     const ask = parseFloat(t.askPrice || markPx * 1.001);
     map[sym] = {
       dex: "Aster",
-      fundingApr: fundingRate * 3 * 365 * 100,
+      fundingApr: fundingRate * 6 * 365 * 100,
       price:     markPx,
       vol24h:    parseFloat(t.quoteVolume || 0),
-      oi:        0,
+      oi,
       spreadPct: markPx > 0 ? (ask - bid) / markPx : 0,
     };
   });
