@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 
-const STORAGE_KEY = "funding_history_v2";
+const STORAGE_KEY = "ranking_history_v1";
 const MAX_ENTRIES = 2016; // ~7 days at 5min intervals
 
 function loadHistory() {
@@ -28,17 +28,16 @@ export default function useHistory() {
   const addEntry = useCallback((data) => {
     if (!data) return;
     const entry = {
-      ts: data.timestamp || Date.now(),
-      hlFunding: data.hlFunding,
-      extFunding: data.extFunding,
+      ts:        data.timestamp || Date.now(),
+      symbol:    data.symbol,
       spreadApr: data.spreadApr,
-      hlVol: data.hlVol,
-      extVol: data.extVol,
-      priceDiff: data.priceDiff,
-      score: data.score,
+      shortDex:  data.shortDex,
+      longDex:   data.longDex,
+      score:     data.score,
+      vol:       data.vol,
+      count:     data.count,
     };
     setHistory(prev => {
-      // Deduplicate: don't add if same minute
       const lastTs = prev[prev.length - 1]?.ts || 0;
       if (entry.ts - lastTs < 60000) return prev;
       const next = [...prev, entry].slice(-MAX_ENTRIES);
@@ -54,28 +53,27 @@ export default function useHistory() {
 
   const exportCsv = useCallback(() => {
     const rows = [
-      "date,hl_funding_apr,ext_funding_apr,spread_apr,hl_vol,ext_vol,price_diff,score",
+      "date,symbol,spread_apr,short_dex,long_dex,score,vol,count",
       ...history.map(h => [
         new Date(h.ts).toISOString(),
-        h.hlFunding?.toFixed(4),
-        h.extFunding?.toFixed(4),
-        h.spreadApr?.toFixed(4),
-        h.hlVol?.toFixed(0),
-        h.extVol?.toFixed(0),
-        h.priceDiff?.toFixed(4),
-        h.score
+        h.symbol         || "",
+        h.spreadApr?.toFixed(4) || "",
+        h.shortDex       || "",
+        h.longDex        || "",
+        h.score          ?? "",
+        h.vol?.toFixed(0) || "",
+        h.count          ?? "",
       ].join(","))
     ].join("\n");
     const blob = new Blob([rows], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `kaito_funding_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `ranking_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }, [history]);
 
-  // Stats
   const stats = history.length > 0 ? {
     avgSpreadApr: history.reduce((s, h) => s + (h.spreadApr || 0), 0) / history.length,
     maxSpreadApr: Math.max(...history.map(h => h.spreadApr || 0)),
