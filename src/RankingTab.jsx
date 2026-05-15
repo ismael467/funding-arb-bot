@@ -31,8 +31,43 @@ function calcScore({ spreadApr, spreadPct, vol, oi }) {
     const os = Math.min(Math.log10(oi) / 8, 1) * 15;
     return Math.min(100, Math.max(0, Math.round(fs + ss + vs + os)));
   }
-  // OI unknown: rescale remaining 85 pts to 100 so missing data doesn't penalize
   return Math.min(100, Math.max(0, Math.round((fs + ss + vs) * 100 / 85)));
+}
+
+function generatePairs(available) {
+  const pairs = [];
+  for (let i = 0; i < available.length; i++) {
+    for (let j = i + 1; j < available.length; j++) {
+      const a = available[i], b = available[j];
+      const shortDex = a.fundingApr >= b.fundingApr ? a : b;
+      const longDex  = a.fundingApr >= b.fundingApr ? b : a;
+      const spreadApr = shortDex.fundingApr - longDex.fundingApr;
+      if (spreadApr < 1) continue;
+      const priceDiff = shortDex.price > 0 && longDex.price > 0
+        ? Math.abs((shortDex.price - longDex.price) / shortDex.price) * 100 : 99;
+      if (priceDiff > 2) continue;
+      const vol = Math.min(shortDex.vol24h, longDex.vol24h);
+      const spreadPct = Math.max(shortDex.spreadPct || 0, longDex.spreadPct || 0);
+      const oi = Math.min(shortDex.oi || 0, longDex.oi || 0);
+      const score = calcScore({ spreadApr, spreadPct, vol, oi });
+      pairs.push({ shortDex, longDex, spreadApr, priceDiff, vol, spreadPct, oi, score });
+    }
+  }
+  return pairs;
+}
+
+function getWinReason(winner, allPairs) {
+  if (allPairs.length <= 1) return "Único par";
+  const byApr = allPairs.reduce((best, p) => p.spreadApr > best.spreadApr ? p : best, allPairs[0]);
+  const sameAsPureApr =
+    winner.shortDex.name === byApr.shortDex.name &&
+    winner.longDex.name  === byApr.longDex.name;
+  if (sameAsPureApr) return "Mayor APR";
+  const reasons = [];
+  if (winner.oi > 0 && (byApr.oi === 0 || winner.oi > byApr.oi * 1.2)) reasons.push("OI↑");
+  if (winner.vol > byApr.vol * 1.2) reasons.push("Vol↑");
+  if (byApr.spreadPct > 0 && winner.spreadPct < byApr.spreadPct * 0.85) reasons.push("Sprd↓");
+  return reasons.length ? reasons.join("+") : "Score≈";
 }
 
 async function proxyGet(url) {
@@ -292,41 +327,31 @@ export default function RankingTab({ config }) {
           .map(d => ({ name: d.name, ...d.map[sym] }));
         if (available.length < 2) continue;
 
-        let shortDex = available[0], longDex = available[0];
-        for (const d of available) {
-          if (d.fundingApr > shortDex.fundingApr) shortDex = d;
-          if (d.fundingApr < longDex.fundingApr)  longDex  = d;
-        }
-        if (shortDex.name === longDex.name) continue;
+        const pairs = generatePairs(available);
+        if (pairs.length === 0) continue;
 
-        const spreadApr = shortDex.fundingApr - longDex.fundingApr;
-        if (spreadApr < 1) continue;
+        const validPairs = pairs.filter(p => p.vol >= MIN_VOL);
+        if (validPairs.length === 0) { filteredByVol++; continue; }
 
-        const priceDiff = shortDex.price > 0 && longDex.price > 0
-          ? Math.abs((shortDex.price - longDex.price) / shortDex.price) * 100 : 99;
-        if (priceDiff > 2) continue;
-
-        const vol = Math.min(shortDex.vol24h, longDex.vol24h);
-
-        if (vol < MIN_VOL) { filteredByVol++; continue; }
-
-        const spreadPct = Math.max(shortDex.spreadPct || 0, longDex.spreadPct || 0);
-        const oi        = Math.min(shortDex.oi || 0, longDex.oi || 0);
-        const score     = calcScore({ spreadApr, spreadPct, vol, oi });
+        const winner = validPairs.reduce((best, p) => p.score > best.score ? p : best, validPairs[0]);
+        const winReason = getWinReason(winner, validPairs);
 
         results.push({
           symbol: sym,
-          shortDex: shortDex.name, longDex: longDex.name,
-          shortFunding: shortDex.fundingApr, longFunding: longDex.fundingApr,
-          shortPrice: shortDex.price, longPrice: longDex.price,
-          spreadApr, priceDiff, spreadPct, vol, oi, score,
+          shortDex: winner.shortDex.name, longDex: winner.longDex.name,
+          shortFunding: winner.shortDex.fundingApr, longFunding: winner.longDex.fundingApr,
+          shortPrice: winner.shortDex.price, longPrice: winner.longDex.price,
+          spreadApr: winner.spreadApr, priceDiff: winner.priceDiff,
+          spreadPct: winner.spreadPct, vol: winner.vol, oi: winner.oi, score: winner.score,
           dexCount: available.length,
           allDex: available,
+          winReason,
+          allPairs: validPairs,
         });
       }
 
       setDebugInfo(prev => `${prev} | Filtrados por vol: ${filteredByVol} | Resultado: ${results.length}`);
-      setResults(results.sort((a, b) => b.spreadApr - a.spreadApr));
+      setResults(results.sort((a, b) => b.score - a.score));
       setLastScan(new Date());
     } catch (e) {
       setError(e.message);
@@ -393,8 +418,8 @@ export default function RankingTab({ config }) {
 
       {results.length > 0 && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 60px", padding: "12px 16px", borderBottom: `1px solid ${T.border}`, background: "#f8fafc" }}>
-            {["#", "TOKEN", "SCORE", "SHORT", "LONG", "SPREAD APR", "VOL MÍN", "DEX"].map(h => (
+          <div style={{ display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 90px", padding: "12px 16px", borderBottom: `1px solid ${T.border}`, background: "#f8fafc" }}>
+            {["#", "TOKEN", "SCORE", "SHORT", "LONG", "SPREAD APR", "VOL MÍN", "RAZÓN"].map(h => (
               <div key={h} style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em" }}>{h}</div>
             ))}
           </div>
@@ -404,7 +429,7 @@ export default function RankingTab({ config }) {
             return (
               <div key={r.symbol}>
                 <div onClick={() => setSelected(isSelect ? null : r)} style={{
-                  display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 60px",
+                  display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 90px",
                   padding: "13px 16px", borderBottom: `1px solid ${T.border}`,
                   background: isSelect ? "#f8fafc" : "white", cursor: "pointer",
                 }}>
@@ -424,7 +449,7 @@ export default function RankingTab({ config }) {
                   </div>
                   <div style={{ color: T.yellow, fontSize: 16, fontWeight: 800 }}>{r.spreadApr?.toFixed(1)}%</div>
                   <div style={{ color: T.green, fontSize: 12, fontWeight: 600 }}>${(r.vol/1000).toFixed(0)}K</div>
-                  <div style={{ color: T.subtle, fontSize: 11 }}>{r.dexCount}</div>
+                  <div style={{ color: T.accent, fontSize: 10, fontWeight: 700 }}>{r.winReason}</div>
                 </div>
                 {isSelect && (
                   <div style={{ padding: "20px", background: "#f8fafc", borderBottom: `1px solid ${T.border}` }}>
@@ -446,6 +471,38 @@ export default function RankingTab({ config }) {
                         </div>
                       ))}
                     </div>
+                    {r.allPairs && r.allPairs.length > 1 && (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>
+                          ANÁLISIS DE PARES · ordenado por score combinado (APR + liquidez + OI)
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          {[...r.allPairs].sort((a, b) => b.score - a.score).map((p, pi) => {
+                            const isWinner = p.shortDex.name === r.shortDex && p.longDex.name === r.longDex;
+                            return (
+                              <div key={pi} style={{
+                                background: isWinner ? T.greenBg : "#f1f5f9",
+                                border: `1px solid ${isWinner ? T.green : T.border}`,
+                                borderRadius: 8, padding: "8px 12px", minWidth: 170,
+                              }}>
+                                <div style={{ fontSize: 11, fontWeight: 700, color: isWinner ? T.green : T.muted }}>
+                                  {p.shortDex.name} SHORT / {p.longDex.name} LONG {isWinner ? "✓ GANADOR" : ""}
+                                </div>
+                                <div style={{ display: "flex", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                                  <span style={{ fontSize: 10, color: T.muted }}>Score: <b style={{ color: isWinner ? T.green : T.text }}>{p.score}</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>APR: <b>{p.spreadApr.toFixed(1)}%</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>OI: <b>${(p.oi/1000).toFixed(0)}K</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>Vol: <b>${(p.vol/1e6).toFixed(1)}M</b></span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{ marginTop: 8, fontSize: 11, color: T.muted }}>
+                          Razón de selección: <b style={{ color: T.accent }}>{r.winReason}</b>
+                        </div>
+                      </div>
+                    )}
                     <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12, color: T.muted, marginBottom: 16 }}>
                       <span>Price parity: <b style={{ color: r.priceDiff < 0.5 ? T.green : T.red }}>{r.priceDiff?.toFixed(3)}%</b></span>
                       <span>Spread mercado: <b>{(r.spreadPct*100).toFixed(3)}%</b></span>
