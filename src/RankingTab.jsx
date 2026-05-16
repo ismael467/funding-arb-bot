@@ -14,7 +14,7 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v4"; // histórico HL — caché 6h
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v5"; // histórico HL — caché 6h
 const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v1";   // tasas Aster/BP — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
@@ -365,7 +365,7 @@ export default function RankingTab({ config }) {
             return true;
           });
 
-          setResults(updated.sort((a, b) => b.score - a.score));
+          setResults(updated.sort((a, b) => b.avgApr - a.avgApr));
           setLastScan(new Date());
           setCacheTime(new Date(cached.ts));
           return;
@@ -437,10 +437,6 @@ export default function RankingTab({ config }) {
           const metrics = calcHistoricalMetrics(hlHistory, other.fundingApr);
           if (!metrics) continue;
 
-          // Filtros duros históricos
-          if (metrics.avgApr      < 10)   continue; // APR estimado ≥ 10%
-          if (metrics.pctPositive < 0.70) continue; // ≥ 70% períodos positivos
-
           const shortDex      = metrics.hlIsShort ? "HL" : other.name;
           const longDex       = metrics.hlIsShort ? other.name : "HL";
           const hlCurApr      = hlMap[sym]?.fundingApr || 0;
@@ -456,7 +452,7 @@ export default function RankingTab({ config }) {
         }
 
         if (pairsWithMetrics.length === 0) {
-          discardedList.push({ symbol: sym, reason: "APR est. < 10% o positivos < 70% en 30d" });
+          discardedList.push({ symbol: sym, reason: "Sin métricas históricas válidas en 30d" });
           continue;
         }
 
@@ -487,7 +483,7 @@ export default function RankingTab({ config }) {
       saveCache(results);
       setCacheTime(null);
       setDiscarded(discardedList.sort((a, b) => a.symbol.localeCompare(b.symbol)));
-      setResults(results.sort((a, b) => b.score - a.score));
+      setResults(results.sort((a, b) => b.avgApr - a.avgApr));
       setLastScan(new Date());
     } catch (e) {
       setError(e.message);
@@ -608,7 +604,7 @@ export default function RankingTab({ config }) {
       {!loading && results.length === 0 && !error && lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
           <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros históricos (APR est. ≥ 10% · Positivos ≥ 70%)</div>
+          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros (Vol ≥ $300K · OI &gt; 0 en Aster · histórico HL suficiente)</div>
         </div>
       )}
       {!loading && results.length === 0 && !error && !lastScan && (
@@ -616,7 +612,7 @@ export default function RankingTab({ config }) {
           <div style={{ fontSize: 36, marginBottom: 16 }}>📈</div>
           <div style={{ color: T.muted, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Ranking basado en histórico real 30d</div>
           <div style={{ color: T.subtle, fontSize: 13, marginBottom: 6 }}>Top 20 tokens HL por vol · Histórico HL vs tasa actual Aster/Backpack</div>
-          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: APR est. ≥ 10% · % positivos ≥ 70% · Vol ≥ $300K/DEX · OI &gt; 0 en Aster</div>
+          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: Vol ≥ $300K/DEX · OI &gt; 0 en Aster · ordenado por Media APR estimada</div>
         </div>
       )}
 
