@@ -20,6 +20,7 @@ const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v2";   // tasas Aster/BP/dYdX �
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
 const TOP_N               = 20;
+const PRIORITY_TOKENS     = ["WLFI"]; // siempre incluidos aunque no estén en top 20 HL
 const TIMEFRAMES          = ["24h", "3d", "7d", "15d", "31d"];
 
 // ─── Score helpers ────────────────────────────────────────────────────────────
@@ -521,11 +522,14 @@ export default function RankingTab({ config }) {
         }
       }
 
-      // Top 20 HL por vol 24h
+      // Top 20 HL por vol 24h + tokens prioritarios (WLFI etc.) aunque no lleguen al top
       const top20 = Object.entries(hlMap)
         .sort((a, b) => b[1].vol24h - a[1].vol24h)
         .slice(0, TOP_N)
         .map(([sym]) => sym);
+      for (const sym of PRIORITY_TOKENS) {
+        if (hlMap[sym] && !top20.includes(sym)) top20.push(sym);
+      }
 
       setProgress({ step: 0, total: top20.length, current: "" });
 
