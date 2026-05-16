@@ -15,8 +15,9 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
+const MIN_VOL_ASTER_COMP  = 100000; // proxy HL vol para pares Aster×ByBit (asterVolume API = token units)
 const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v12"; // histórico HL+dYdX+Aster+AsterComp — caché 6h
-const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v3";   // tasas Aster/BP/dYdX+AsterComp — caché 15 min
+const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v4";   // tasas Aster/BP/dYdX+AsterComp — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
 const TOP_N               = 50;
@@ -561,9 +562,9 @@ export default function RankingTab({ config }) {
             if (r.sourceType === "AsterComp") {
               const comp = asterCompMap[r.symbol];
               if (!comp) return null;
-              const realVol = asterMap[r.symbol]?.vol24h || hlMap[r.symbol]?.vol24h || 0;
-              if (realVol < MIN_VOL_PER_DEX) return null;
-              return { ...r, currentSpread: Math.abs(comp.currentSpread), currentHlApr: comp.asterApr, otherFundingApr: comp.bybitApr, hlVol: realVol, otherVol: realVol, vol: realVol };
+              const hlVol24h = hlMap[r.symbol]?.vol24h || 0;
+              if (hlVol24h < MIN_VOL_ASTER_COMP) return null;
+              return { ...r, currentSpread: Math.abs(comp.currentSpread), currentHlApr: comp.asterApr, otherFundingApr: comp.bybitApr, hlVol: hlVol24h, otherVol: hlVol24h, vol: hlVol24h };
             }
             const hlVol    = hlMap[r.symbol]?.vol24h || 0;
             const otherVol = r.otherDex === "Aster"   ? asterMap[r.symbol]?.vol24h || 0
@@ -728,12 +729,12 @@ export default function RankingTab({ config }) {
       }
 
       // Phase B: Aster×ByBit pairs from Aster Comparison API (no ByBit direct calls)
-      // Filtrar por vol real en USDT: asterMap (ticker Aster) > hlMap > descartar
+      // asterVolume de esa API está en unidades de token (no USDT) — usar vol HL como proxy de liquidez
       let phaseB = 0;
       for (const [sym, comp] of Object.entries(asterCompMap)) {
-        const realVol = asterMap[sym]?.vol24h || hlMap[sym]?.vol24h || 0;
-        if (realVol < MIN_VOL_PER_DEX) {
-          console.log(`[AsterComp] ${sym} descartado vol=$${(realVol/1000).toFixed(0)}K (Aster:${(asterMap[sym]?.vol24h||0)/1000|0}K HL:${(hlMap[sym]?.vol24h||0)/1000|0}K)`);
+        const hlVol24h = hlMap[sym]?.vol24h || 0;
+        if (hlVol24h < MIN_VOL_ASTER_COMP) {
+          console.log(`[AsterComp] ${sym} descartado vol HL=$${(hlVol24h/1000).toFixed(0)}K`);
           continue;
         }
         const absAvg = Math.abs(comp.avgSpread);
@@ -757,16 +758,16 @@ export default function RankingTab({ config }) {
           currentSpread:   Math.abs(comp.currentSpread),
           currentHlApr:    comp.asterApr,
           otherFundingApr: comp.bybitApr,
-          hlVol:           realVol,
-          otherVol:        realVol,
-          vol:             realVol,
+          hlVol:           hlVol24h,
+          otherVol:        hlVol24h,
+          vol:             hlVol24h,
           score,
           stabilityLabel: "Media*",
           stabilityColor: T.yellow,
           allPairs: [],
           allDex: [
-            { name: "Aster", fundingApr: comp.asterApr, vol24h: realVol, price: 0, oi: 0 },
-            { name: "ByBit", fundingApr: comp.bybitApr, vol24h: realVol, price: 0, oi: 0 },
+            { name: "Aster", fundingApr: comp.asterApr, vol24h: hlVol24h, price: 0, oi: 0 },
+            { name: "ByBit", fundingApr: comp.bybitApr, vol24h: hlVol24h, price: 0, oi: 0 },
           ],
         });
         phaseB++;
