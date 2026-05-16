@@ -15,11 +15,11 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v9"; // histórico HL+dYdX+Aster — caché 6h
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v10"; // histórico HL+dYdX+Aster — caché 6h
 const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v2";   // tasas Aster/BP/dYdX — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
-const TOP_N               = 20;
+const TOP_N               = 50;
 const PRIORITY_TOKENS     = ["WLFI"]; // siempre incluidos aunque no estén en top 20 HL
 const TIMEFRAMES          = ["24h", "3d", "7d", "15d", "31d"];
 
@@ -687,7 +687,7 @@ export default function RankingTab({ config }) {
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <div style={{ color: T.subtle, fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            RANKING HISTÓRICO 30d · HL × ASTER × BACKPACK × dYdX
+            RANKING HISTÓRICO 30d · TOP 50 HL × ASTER × BACKPACK × dYdX
           </div>
           {lastScan && (
             <div style={{ color: T.subtle, fontSize: 12, marginTop: 4 }}>
