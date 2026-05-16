@@ -14,7 +14,7 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v5"; // histórico HL — caché 6h
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v6"; // histórico HL — caché 6h
 const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v1";   // tasas Aster/BP — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
@@ -360,8 +360,7 @@ export default function RankingTab({ config }) {
             return { ...r, hlVol, otherVol, vol: Math.min(hlVol, otherVol), currentSpread, currentHlApr: hlApr, otherFundingApr: othApr };
           }).filter(r => {
             if (r.hlVol < MIN_VOL_PER_DEX || r.otherVol < MIN_VOL_PER_DEX) return false;
-            // Re-verificar OI de Aster: si ahora es $0, el mercado ya no existe
-            if (r.otherDex === "Aster" && (asterMap[r.symbol]?.oi || 0) === 0) return false;
+            // Aster no expone OI en su API — no filtrar por OI
             return true;
           });
 
@@ -391,19 +390,16 @@ export default function RankingTab({ config }) {
 
         const hlVol = hlMap[sym]?.vol24h || 0;
 
-        // DEX contrapartes: vol >= MIN y, para Aster, OI > 0 (sin OI real = mercado inexistente)
+        // DEX contrapartes: vol >= MIN (Aster no expone OI — filtrar solo por vol)
         const candidates = [];
         const localDiscards = [];
 
         if (asterMap[sym]) {
           const d = asterMap[sym];
-          if (d.vol24h >= MIN_VOL_PER_DEX && d.oi > 0) {
+          if (d.vol24h >= MIN_VOL_PER_DEX) {
             candidates.push({ name: "Aster", ...d });
           } else {
-            const reason = d.oi === 0
-              ? `Sin datos suficientes en Aster (OI = $0)`
-              : `Vol insuf. en Aster ($${(d.vol24h / 1000).toFixed(0)}K)`;
-            localDiscards.push(reason);
+            localDiscards.push(`Vol insuf. en Aster ($${(d.vol24h / 1000).toFixed(0)}K)`);
           }
         }
         if (backMap[sym]) {
@@ -474,8 +470,8 @@ export default function RankingTab({ config }) {
           stabilityColor: stab > 0.7 ? T.green : stab > 0.4 ? T.yellow : T.red,
           allPairs: pairsWithMetrics,
           allDex: [
-            { name: "HL",       fundingApr: hlMap[sym]?.fundingApr,  vol24h: hlVol,            price: hlMap[sym]?.price },
-            ...candidates.map(c => ({ name: c.name, fundingApr: c.fundingApr, vol24h: c.vol24h, price: c.price })),
+            { name: "HL",       fundingApr: hlMap[sym]?.fundingApr,  vol24h: hlVol,            price: hlMap[sym]?.price, oi: hlMap[sym]?.oi },
+            ...candidates.map(c => ({ name: c.name, fundingApr: c.fundingApr, vol24h: c.vol24h, price: c.price, oi: c.oi })),
           ],
         });
       }
@@ -604,7 +600,7 @@ export default function RankingTab({ config }) {
       {!loading && results.length === 0 && !error && lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
           <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros (Vol ≥ $300K · OI &gt; 0 en Aster · histórico HL suficiente)</div>
+          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros (Vol ≥ $300K/DEX · histórico HL suficiente)</div>
         </div>
       )}
       {!loading && results.length === 0 && !error && !lastScan && (
@@ -612,7 +608,7 @@ export default function RankingTab({ config }) {
           <div style={{ fontSize: 36, marginBottom: 16 }}>📈</div>
           <div style={{ color: T.muted, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Ranking basado en histórico real 30d</div>
           <div style={{ color: T.subtle, fontSize: 13, marginBottom: 6 }}>Top 20 tokens HL por vol · Histórico HL vs tasa actual Aster/Backpack</div>
-          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: Vol ≥ $300K/DEX · OI &gt; 0 en Aster · ordenado por Media APR estimada</div>
+          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: Vol ≥ $300K/DEX · ordenado por Media APR estimada (OI de Aster no disponible en API)</div>
         </div>
       )}
 
@@ -727,6 +723,7 @@ export default function RankingTab({ config }) {
                             {d.fundingApr > 0 ? "+" : ""}{d.fundingApr?.toFixed(2)}%
                           </div>
                           <div style={{ color: T.subtle, fontSize: 10 }}>Vol ${(d.vol24h / 1e6).toFixed(1)}M</div>
+                          <div style={{ color: T.subtle, fontSize: 10 }}>OI: {d.name === "Aster" ? "N/D" : d.oi > 0 ? `$${(d.oi / 1e6).toFixed(1)}M` : "N/D"}</div>
                           {d.name === r.shortDex && <div style={{ color: T.red,   fontSize: 10, fontWeight: 700, marginTop: 4 }}>← SHORT (hoy)</div>}
                           {d.name === r.longDex  && <div style={{ color: T.green, fontSize: 10, fontWeight: 700, marginTop: 4 }}>← LONG (hoy)</div>}
                         </div>
