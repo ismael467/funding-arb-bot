@@ -13,11 +13,13 @@ const T = {
   yellow: "#f59e0b", blue: "#3b82f6", accent: "#6366f1",
 };
 
-const MIN_VOL_PER_DEX = 300000;
-const CACHE_KEY  = "fundingArb_ranking30d_v3";
-const CACHE_TTL  = 6 * 3600 * 1000;
-const TOP_N      = 20;
-const TIMEFRAMES = ["24h", "3d", "7d", "15d", "31d"];
+const MIN_VOL_PER_DEX     = 300000;
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v4"; // histórico HL — caché 6h
+const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v1";   // tasas Aster/BP — caché 15 min
+const CACHE_TTL           = 6 * 3600 * 1000;
+const CACHE_DEX_TTL       = 15 * 60 * 1000;
+const TOP_N               = 20;
+const TIMEFRAMES          = ["24h", "3d", "7d", "15d", "31d"];
 
 // ─── Score helpers ────────────────────────────────────────────────────────────
 
@@ -28,38 +30,45 @@ function getCls(score) {
   return              { label: "AVOID", color: T.red,    bg: T.redBg   };
 }
 
-// 40% media APR · 35% % días positivos · 25% estabilidad (inverso stdDev)
-function calcHistoricalScore(avgApr, pctPositive, stdDev) {
+// 40% media APR · 35% % períodos positivos · 25% estabilidad (1 - σ/media)
+function calcHistoricalScore(avgApr, pctPositive, stability) {
   const aprScore  = Math.min(Math.max(avgApr, 0) / 100, 1) * 40;
   const pctScore  = pctPositive * 35;
-  const stabScore = Math.max(0, 1 - stdDev / 100) * 25;
+  const stabScore = stability * 25;          // ya está en [0, 1]
   return Math.min(100, Math.max(0, Math.round(aprScore + pctScore + stabScore)));
 }
 
-// spreads[i] = hlApr_i - otherFundingApr
-// Se orienta para que "positivo" siempre signifique "la estrategia gana"
+// spread_i = |HL_funding_i_APR - DEX2_funding_actual_APR|
+// pctPositive = % períodos donde spread_i > 0.01%
+// stability   = max(0, 1 - σ / media)
 function calcHistoricalMetrics(hlHistory, otherFundingApr) {
   if (!hlHistory || hlHistory.length < 5) return null;
-  const raw = hlHistory.map(d =>
+
+  const signed = hlHistory.map(d =>
     parseFloat(d.fundingRate) * 3 * 365 * 100 - otherFundingApr
   );
-  const n      = raw.length;
-  const rawAvg = raw.reduce((a, b) => a + b, 0) / n;
-  const hlIsShort = rawAvg >= 0;
-  const s      = hlIsShort ? raw : raw.map(v => -v);
-  const avgApr = Math.abs(rawAvg);
-  const pctPos = s.filter(v => v > 0).length / n;
-  const stdDev = Math.sqrt(s.reduce((a, v) => a + (v - avgApr) ** 2, 0) / n);
+  const signedAvg = signed.reduce((a, b) => a + b, 0) / signed.length;
+  const hlIsShort = signedAvg >= 0; // dirección predominante
+
+  const abs    = signed.map(v => Math.abs(v));
+  const n      = abs.length;
+  const avgApr = abs.reduce((a, b) => a + b, 0) / n;
+  const pctPos = abs.filter(v => v > 0.01).length / n; // > 0.01% APR
+  const stdDev = Math.sqrt(abs.reduce((a, v) => a + (v - avgApr) ** 2, 0) / n);
+  const stability = Math.max(0, 1 - stdDev / Math.max(avgApr, 0.001));
+
   let consec = 0;
-  for (let i = s.length - 1; i >= 0; i--) { if (s[i] > 0) consec++; else break; }
-  return { avgApr, pctPositive: pctPos, stdDev, consecutiveDays: Math.floor(consec / 3), n, hlIsShort };
+  for (let i = abs.length - 1; i >= 0; i--) { if (abs[i] > 0.01) consec++; else break; }
+
+  return { avgApr, pctPositive: pctPos, stdDev, stability, consecutiveDays: Math.floor(consec / 3), n, hlIsShort };
 }
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
+// Caché de resultados históricos (6h — histórico HL no cambia rápido)
 function loadCache() {
   try {
-    const raw = localStorage.getItem(CACHE_KEY);
+    const raw = localStorage.getItem(CACHE_RESULTS_KEY);
     if (!raw) return null;
     const { ts, data } = JSON.parse(raw);
     if (Date.now() - ts > CACHE_TTL) return null;
@@ -67,7 +76,21 @@ function loadCache() {
   } catch { return null; }
 }
 function saveCache(data) {
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data })); } catch {}
+  try { localStorage.setItem(CACHE_RESULTS_KEY, JSON.stringify({ ts: Date.now(), data })); } catch {}
+}
+
+// Caché de tasas actuales Aster/Backpack (15 min — cambian con frecuencia)
+function loadDexCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_DEX_RATES_KEY);
+    if (!raw) return null;
+    const { ts, asterMap, backMap } = JSON.parse(raw);
+    if (Date.now() - ts > CACHE_DEX_TTL) return null;
+    return { asterMap, backMap, ts };
+  } catch { return null; }
+}
+function saveDexCache(asterMap, backMap) {
+  try { localStorage.setItem(CACHE_DEX_RATES_KEY, JSON.stringify({ ts: Date.now(), asterMap, backMap })); } catch {}
 }
 
 // ─── Network ─────────────────────────────────────────────────────────────────
@@ -295,10 +318,23 @@ export default function RankingTab({ config }) {
     setProgress({ step: 0, total: 0, current: "Cargando datos de DEX..." });
 
     try {
-      // Siempre cargar datos actuales (vol, spread hoy, confirmar par activo)
-      const [hlMap, asterMap, backMap] = await Promise.allSettled([
-        fetchHL(), fetchAster(), fetchBackpack(),
-      ]).then(r => r.map(x => x.status === "fulfilled" ? x.value : {}));
+      // HL siempre fresco (top20, spread actual, confirmar que el par sigue activo)
+      setProgress({ step: 0, total: 0, current: "Cargando datos HL..." });
+      const hlMap = await fetchHL().catch(() => ({}));
+
+      // Aster y Backpack: caché 15 min (tasas cambian, pero no cada segundo)
+      let asterMap, backMap;
+      const dexCached = !forceRefresh ? loadDexCache() : null;
+      if (dexCached) {
+        asterMap = dexCached.asterMap;
+        backMap  = dexCached.backMap;
+      } else {
+        setProgress({ step: 0, total: 0, current: "Cargando tasas Aster/Backpack..." });
+        [asterMap, backMap] = await Promise.allSettled([
+          fetchAster(), fetchBackpack(),
+        ]).then(r => r.map(x => x.status === "fulfilled" ? x.value : {}));
+        saveDexCache(asterMap, backMap);
+      }
 
       setDexStatus({
         HL:       Object.keys(hlMap).length,
@@ -349,7 +385,9 @@ export default function RankingTab({ config }) {
 
       for (let i = 0; i < top20.length; i++) {
         const sym = top20[i];
-        setProgress({ step: i + 1, total: top20.length, current: sym });
+
+        // Fase 1: descarga de histórico
+        setProgress({ step: i + 1, total: top20.length, current: sym, phase: 1 });
 
         const hlVol = hlMap[sym]?.vol24h || 0;
 
@@ -383,12 +421,15 @@ export default function RankingTab({ config }) {
           continue;
         }
 
-        // Descargar histórico 30d de HL una sola vez por token
+        // Fase 1: descarga de histórico 30d de HL (una vez por token)
         const hlHistory = await fetchHLHistory30d(sym);
         if (hlHistory.length < 10) {
           discardedList.push({ symbol: sym, reason: "Sin histórico HL suficiente" });
           continue;
         }
+
+        // Fase 2: calcular spreads estimados
+        setProgress({ step: i + 1, total: top20.length, current: sym, phase: 2 });
 
         // Evaluar cada par (HL × Aster, HL × Backpack)
         const pairsWithMetrics = [];
@@ -397,14 +438,14 @@ export default function RankingTab({ config }) {
           if (!metrics) continue;
 
           // Filtros duros históricos
-          if (metrics.avgApr      < 5)    continue;
-          if (metrics.pctPositive < 0.60) continue;
+          if (metrics.avgApr      < 10)   continue; // APR estimado ≥ 10%
+          if (metrics.pctPositive < 0.70) continue; // ≥ 70% períodos positivos
 
           const shortDex      = metrics.hlIsShort ? "HL" : other.name;
           const longDex       = metrics.hlIsShort ? other.name : "HL";
           const hlCurApr      = hlMap[sym]?.fundingApr || 0;
           const currentSpread = metrics.hlIsShort ? hlCurApr - other.fundingApr : other.fundingApr - hlCurApr;
-          const score         = calcHistoricalScore(metrics.avgApr, metrics.pctPositive, metrics.stdDev);
+          const score         = calcHistoricalScore(metrics.avgApr, metrics.pctPositive, metrics.stability);
 
           pairsWithMetrics.push({
             shortDex, longDex, otherDex: other.name,
@@ -415,25 +456,26 @@ export default function RankingTab({ config }) {
         }
 
         if (pairsWithMetrics.length === 0) {
-          discardedList.push({ symbol: sym, reason: "Media APR < 5% o positivos < 60% en 30d" });
+          discardedList.push({ symbol: sym, reason: "APR est. < 10% o positivos < 70% en 30d" });
           continue;
         }
 
-        const winner    = pairsWithMetrics.reduce((b, p) => p.score > b.score ? p : b, pairsWithMetrics[0]);
-        const stabRatio = Math.max(0, 1 - winner.stdDev / 100);
+        const winner = pairsWithMetrics.reduce((b, p) => p.score > b.score ? p : b, pairsWithMetrics[0]);
+        const stab   = winner.stability; // ya es 0-1 de calcHistoricalMetrics
 
         results.push({
           symbol: sym,
           shortDex: winner.shortDex, longDex: winner.longDex, otherDex: winner.otherDex,
           avgApr: winner.avgApr, pctPositive: winner.pctPositive, stdDev: winner.stdDev,
+          stability: winner.stability,
           consecutiveDays: winner.consecutiveDays, n: winner.n,
           currentSpread: winner.currentSpread, currentHlApr: winner.currentHlApr,
           otherFundingApr: winner.otherFundingApr,
           hlVol, otherVol: winner.otherVol24h,
           vol: Math.min(hlVol, winner.otherVol24h),
           score: winner.score,
-          stability: stabRatio > 0.7 ? "Alta" : stabRatio > 0.4 ? "Media" : "Baja",
-          stabilityColor: stabRatio > 0.7 ? T.green : stabRatio > 0.4 ? T.yellow : T.red,
+          stabilityLabel: stab > 0.7 ? "Alta" : stab > 0.4 ? "Media" : "Baja",
+          stabilityColor: stab > 0.7 ? T.green : stab > 0.4 ? T.yellow : T.red,
           allPairs: pairsWithMetrics,
           allDex: [
             { name: "HL",       fundingApr: hlMap[sym]?.fundingApr,  vol24h: hlVol,            price: hlMap[sym]?.price },
@@ -512,8 +554,8 @@ export default function RankingTab({ config }) {
         background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10,
         padding: "10px 14px", fontSize: 12, color: "#0369a1",
       }}>
-        Score basado en histórico 30d de HL — el spread de hoy puede ser diferente.
-        La tasa de Aster/Backpack se usa como referencia fija para estimar el spread histórico.
+        APR estimado usando funding histórico HL y funding actual de Aster/Backpack como referencia.
+        El spread real puede variar.
       </div>
 
       {/* ── Error ── */}
@@ -528,28 +570,34 @@ export default function RankingTab({ config }) {
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 24 }}>
           {progress.total === 0 ? (
             <div style={{ color: T.accent, fontSize: 15, fontWeight: 700, textAlign: "center" }}>
-              Cargando datos de DEX...
+              {progress.current || "Cargando datos de DEX..."}
             </div>
           ) : (
             <>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
                 <span style={{ color: T.text, fontSize: 14, fontWeight: 700 }}>
-                  Analizando {progress.current}...
+                  {progress.phase === 1
+                    ? `Descargando histórico ${progress.current}...`
+                    : `Calculando spreads estimados...`}
                 </span>
                 <span style={{ color: T.muted, fontSize: 13 }}>
-                  {progress.step}/{progress.total} tokens
+                  {progress.step}/{progress.total}
                 </span>
               </div>
               <div style={{ background: T.border, borderRadius: 6, height: 8 }}>
                 <div style={{
-                  background: `linear-gradient(90deg, ${T.accent}, ${T.green})`,
+                  background: progress.phase === 1
+                    ? `linear-gradient(90deg, ${T.accent}, #818cf8)`
+                    : `linear-gradient(90deg, #818cf8, ${T.green})`,
                   borderRadius: 6, height: 8,
                   width: `${progressPct}%`,
                   transition: "width 0.4s ease",
                 }} />
               </div>
               <div style={{ color: T.subtle, fontSize: 11, marginTop: 8, textAlign: "center" }}>
-                Descargando 30 días de histórico de HL · Vol mín $300K/DEX
+                {progress.phase === 1
+                  ? "Fase 1/2 · Descargando histórico HL 30d"
+                  : "Fase 2/2 · Calculando spread estimado |HL − DEX2|"}
               </div>
             </>
           )}
@@ -560,7 +608,7 @@ export default function RankingTab({ config }) {
       {!loading && results.length === 0 && !error && lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
           <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros históricos (APR ≥ 5% · Positivos ≥ 60%)</div>
+          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros históricos (APR est. ≥ 10% · Positivos ≥ 70%)</div>
         </div>
       )}
       {!loading && results.length === 0 && !error && !lastScan && (
@@ -568,7 +616,7 @@ export default function RankingTab({ config }) {
           <div style={{ fontSize: 36, marginBottom: 16 }}>📈</div>
           <div style={{ color: T.muted, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Ranking basado en histórico real 30d</div>
           <div style={{ color: T.subtle, fontSize: 13, marginBottom: 6 }}>Top 20 tokens HL por vol · Histórico HL vs tasa actual Aster/Backpack</div>
-          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: media APR ≥ 5% · % positivos ≥ 60% · Vol ≥ $300K/DEX</div>
+          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: APR est. ≥ 10% · % positivos ≥ 70% · Vol ≥ $300K/DEX · OI &gt; 0 en Aster</div>
         </div>
       )}
 
@@ -589,16 +637,23 @@ export default function RankingTab({ config }) {
           {results.map((r, i) => {
             const c = getCls(r.score);
             const isSelect = selected?.symbol === r.symbol;
-            const todayColor = r.currentSpread >= r.avgApr * 0.5 ? T.green : r.currentSpread > 0 ? T.yellow : T.red;
+            // HOY: ≥80% de la media → verde | 40-80% → amarillo | <40% → rojo
+            const todayRatio = r.avgApr > 0 ? r.currentSpread / r.avgApr : 0;
+            const todayColor = todayRatio >= 0.8 ? T.green : todayRatio >= 0.4 ? T.yellow : T.red;
+            const tooltip    = `Basado en ${r.n} períodos HL + tasa actual ${r.otherDex}`;
 
             return (
               <div key={r.symbol}>
-                <div onClick={() => setSelected(isSelect ? null : r)} style={{
-                  display: "grid",
-                  gridTemplateColumns: "28px 76px 110px 90px 80px 70px 60px 80px",
-                  padding: "13px 16px", borderBottom: `1px solid ${T.border}`,
-                  background: isSelect ? "#f8fafc" : "white", cursor: "pointer",
-                }}>
+                <div
+                  onClick={() => setSelected(isSelect ? null : r)}
+                  title={tooltip}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "28px 76px 110px 90px 80px 70px 60px 80px",
+                    padding: "13px 16px", borderBottom: `1px solid ${T.border}`,
+                    background: isSelect ? "#f8fafc" : "white", cursor: "pointer",
+                  }}
+                >
                   {/* # */}
                   <div style={{ color: T.subtle, fontSize: 12 }}>{i + 1}</div>
 
@@ -610,7 +665,7 @@ export default function RankingTab({ config }) {
                     <div style={{ fontSize: 11, fontWeight: 700, color: T.text }}>
                       {r.shortDex} → {r.longDex}
                     </div>
-                    <div style={{ fontSize: 10, color: T.subtle }}>n={r.n} períodos</div>
+                    <div style={{ fontSize: 10, color: T.subtle }}>{r.n} períodos · {r.otherDex}</div>
                   </div>
 
                   {/* MEDIA APR */}
@@ -619,13 +674,13 @@ export default function RankingTab({ config }) {
                   </div>
 
                   {/* % POSITIVOS */}
-                  <div style={{ color: r.pctPositive >= 0.75 ? T.green : r.pctPositive >= 0.60 ? T.yellow : T.red, fontSize: 13, fontWeight: 700 }}>
+                  <div style={{ color: r.pctPositive >= 0.85 ? T.green : r.pctPositive >= 0.70 ? T.yellow : T.red, fontSize: 13, fontWeight: 700 }}>
                     {(r.pctPositive * 100).toFixed(0)}%
                   </div>
 
                   {/* ESTAB. */}
                   <div style={{ color: r.stabilityColor, fontSize: 12, fontWeight: 700 }}>
-                    {r.stability}
+                    {r.stabilityLabel}
                   </div>
 
                   {/* SCORE */}
@@ -648,7 +703,7 @@ export default function RankingTab({ config }) {
                     <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
                       {[
                         { label: "Media APR 30d",       value: `+${r.avgApr.toFixed(2)}%`,              color: T.green },
-                        { label: "% Períodos positivos", value: `${(r.pctPositive * 100).toFixed(1)}%`, color: r.pctPositive >= 0.75 ? T.green : T.yellow },
+                        { label: "% Períodos positivos", value: `${(r.pctPositive * 100).toFixed(1)}%`, color: r.pctPositive >= 0.85 ? T.green : r.pctPositive >= 0.70 ? T.yellow : T.red },
                         { label: "Desv. estándar",       value: `${r.stdDev.toFixed(1)}%`,               color: T.muted },
                         { label: "Días consec. positivos", value: `${r.consecutiveDays}d`,               color: r.consecutiveDays >= 7 ? T.green : T.muted },
                         { label: "Spread hoy (referencia)", value: `${r.currentSpread >= 0 ? "+" : ""}${r.currentSpread.toFixed(2)}%`, color: r.currentSpread > 0 ? T.blue : T.red },
