@@ -15,12 +15,15 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v10"; // histórico HL+dYdX+Aster — caché 6h
-const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v2";   // tasas Aster/BP/dYdX — caché 15 min
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v11"; // histórico HL+dYdX+Aster+AsterComp — caché 6h
+const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v3";   // tasas Aster/BP/dYdX+AsterComp — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
 const TOP_N               = 50;
-const PRIORITY_TOKENS     = ["WLFI"]; // siempre incluidos aunque no estén en top 20 HL
+const PRIORITY_TOKENS     = ["WLFI"]; // siempre incluidos aunque no estén en top 50 HL
+const ASTER_COMP_URL      = "https://www.asterdex.com/bapi/future/v1/public/future/aster/marketing/funding-rate-comparison";
+// Anualizar comparación según el período: el valor representa la acumulación total del período
+const PERIOD_TO_ANNUAL    = { "1Y": 1, "1M": 12, "1W": 52, "1D": 365, "8h": 1095, "4h": 2190, hourly: 8760 };
 const TIMEFRAMES          = ["24h", "3d", "7d", "15d", "31d"];
 
 // ─── Score helpers ────────────────────────────────────────────────────────────
@@ -122,13 +125,13 @@ function loadDexCache() {
   try {
     const raw = localStorage.getItem(CACHE_DEX_RATES_KEY);
     if (!raw) return null;
-    const { ts, asterMap, backMap, dydxMap } = JSON.parse(raw);
+    const { ts, asterMap, backMap, dydxMap, asterCompMap } = JSON.parse(raw);
     if (Date.now() - ts > CACHE_DEX_TTL) return null;
-    return { asterMap, backMap, dydxMap: dydxMap || {}, ts };
+    return { asterMap, backMap, dydxMap: dydxMap || {}, asterCompMap: asterCompMap || {}, ts };
   } catch { return null; }
 }
-function saveDexCache(asterMap, backMap, dydxMap) {
-  try { localStorage.setItem(CACHE_DEX_RATES_KEY, JSON.stringify({ ts: Date.now(), asterMap, backMap, dydxMap })); } catch {}
+function saveDexCache(asterMap, backMap, dydxMap, asterCompMap) {
+  try { localStorage.setItem(CACHE_DEX_RATES_KEY, JSON.stringify({ ts: Date.now(), asterMap, backMap, dydxMap, asterCompMap })); } catch {}
 }
 
 // ─── Network ─────────────────────────────────────────────────────────────────
@@ -306,6 +309,57 @@ async function fetchDydxHistory(symbol, days) {
 
 function fetchDydxHistory30d(symbol) { return fetchDydxHistory(symbol, 30); }
 
+// Aster Comparison API — CORS libre (asterdex.com domain). Devuelve spread Aster×ByBit
+// por período (datos son propiedad de Aster, no se llama a ByBit directamente).
+async function fetchAsterComparison() {
+  try {
+    const [res1Y, res1D] = await Promise.all([
+      fetch(`${ASTER_COMP_URL}?period=1Y`),
+      fetch(`${ASTER_COMP_URL}?period=1D`),
+    ]);
+    if (!res1Y.ok || !res1D.ok) { console.warn("[AsterComp] HTTP error", res1Y.status, res1D.status); return {}; }
+    const [data1Y, data1D] = await Promise.all([res1Y.json(), res1D.json()]);
+
+    const extract = json => {
+      if (Array.isArray(json)) return json;
+      if (json?.data && Array.isArray(json.data)) return json.data;
+      if (json?.result && Array.isArray(json.result)) return json.result;
+      return [];
+    };
+    // Filter to the requested period in case API returns all periods
+    const list1Y = extract(data1Y).filter(i => !i.period || i.period === "1Y");
+    const list1D = extract(data1D).filter(i => !i.period || i.period === "1D");
+
+    const map1D = {};
+    list1D.forEach(item => { if (item?.pair) map1D[item.pair] = item; });
+
+    const map = {};
+    for (const item of list1Y) {
+      if (!item?.pair || item.bybitFundingRate == null || item.asterBybitComparison == null) continue;
+      const vol = parseFloat(item.asterVolume || 0);
+      if (vol < MIN_VOL_PER_DEX) continue;
+
+      const sym    = item.pair.replace(/USDT$/, "").replace(/BUSD$/, "");
+      const mult1Y = PERIOD_TO_ANNUAL["1Y"];
+      const avgSpread = parseFloat(item.asterBybitComparison) * mult1Y * 100; // → APR %
+      const asterApr  = parseFloat(item.asterFundingRate)    * mult1Y * 100;
+      const bybitApr  = parseFloat(item.bybitFundingRate)    * mult1Y * 100;
+
+      const cur1D = map1D[item.pair];
+      const currentSpread = cur1D?.asterBybitComparison != null
+        ? parseFloat(cur1D.asterBybitComparison) * PERIOD_TO_ANNUAL["1D"] * 100
+        : avgSpread;
+
+      map[sym] = { pair: item.pair, asterApr, bybitApr, avgSpread, currentSpread, vol24h: vol };
+    }
+    console.log(`[AsterComp] ${Object.keys(map).length} pares Aster×ByBit (vol≥$${(MIN_VOL_PER_DEX/1000).toFixed(0)}K)`);
+    return map;
+  } catch (e) {
+    console.error("[AsterComp] error:", e.message);
+    return {};
+  }
+}
+
 // Histórico simple para el gráfico de detalle (sin paginación, variable timeframe)
 async function fetchHLHistory(symbol, days) {
   try {
@@ -476,25 +530,27 @@ export default function RankingTab({ config }) {
       const hlMap = await fetchHL().catch(() => ({}));
 
       // Aster, Backpack y dYdX: caché 15 min
-      let asterMap, backMap, dydxMap;
+      let asterMap, backMap, dydxMap, asterCompMap;
       const dexCached = !forceRefresh ? loadDexCache() : null;
       if (dexCached) {
-        asterMap = dexCached.asterMap;
-        backMap  = dexCached.backMap;
-        dydxMap  = dexCached.dydxMap;
+        asterMap     = dexCached.asterMap;
+        backMap      = dexCached.backMap;
+        dydxMap      = dexCached.dydxMap;
+        asterCompMap = dexCached.asterCompMap || {};
       } else {
-        setProgress({ step: 0, total: 0, current: "Cargando tasas Aster/Backpack/dYdX..." });
-        [asterMap, backMap, dydxMap] = await Promise.allSettled([
-          fetchAster(), fetchBackpack(), fetchDydx(),
+        setProgress({ step: 0, total: 0, current: "Cargando tasas Aster/Backpack/dYdX/AsterComp..." });
+        [asterMap, backMap, dydxMap, asterCompMap] = await Promise.allSettled([
+          fetchAster(), fetchBackpack(), fetchDydx(), fetchAsterComparison(),
         ]).then(r => r.map(x => x.status === "fulfilled" ? x.value : {}));
-        saveDexCache(asterMap, backMap, dydxMap);
+        saveDexCache(asterMap, backMap, dydxMap, asterCompMap);
       }
 
       setDexStatus({
-        HL:       Object.keys(hlMap).length,
-        Aster:    Object.keys(asterMap).length,
-        Backpack: Object.keys(backMap).length,
-        dYdX:     Object.keys(dydxMap).length,
+        HL:        Object.keys(hlMap).length,
+        Aster:     Object.keys(asterMap).length,
+        Backpack:  Object.keys(backMap).length,
+        dYdX:      Object.keys(dydxMap).length,
+        "A×B":     Object.keys(asterCompMap).length,
       });
 
       // Intentar caché (evita re-descargar 30d de histórico)
@@ -503,6 +559,11 @@ export default function RankingTab({ config }) {
         if (cached) {
           // Actualizar spread hoy y vol actuales sobre el histórico cacheado
           const updated = cached.data.map(r => {
+            if (r.sourceType === "AsterComp") {
+              const comp = asterCompMap[r.symbol];
+              if (!comp) return null;
+              return { ...r, currentSpread: Math.abs(comp.currentSpread), currentHlApr: comp.asterApr, otherFundingApr: comp.bybitApr, hlVol: comp.vol24h, otherVol: comp.vol24h, vol: comp.vol24h };
+            }
             const hlVol    = hlMap[r.symbol]?.vol24h || 0;
             const otherVol = r.otherDex === "Aster"   ? asterMap[r.symbol]?.vol24h || 0
                            : r.otherDex === "dYdX"    ? dydxMap[r.symbol]?.vol24h  || 0
@@ -513,7 +574,7 @@ export default function RankingTab({ config }) {
                            :                            backMap[r.symbol]?.fundingApr   || 0;
             const currentSpread = r.shortDex === "HL" ? hlApr - othApr : othApr - hlApr;
             return { ...r, hlVol, otherVol, vol: Math.min(hlVol, otherVol), currentSpread, currentHlApr: hlApr, otherFundingApr: othApr };
-          }).filter(r => r.hlVol >= MIN_VOL_PER_DEX && r.otherVol >= MIN_VOL_PER_DEX);
+          }).filter(r => r !== null && (r.sourceType === "AsterComp" || (r.hlVol >= MIN_VOL_PER_DEX && r.otherVol >= MIN_VOL_PER_DEX)));
 
           setResults(updated.sort((a, b) => b.avgApr - a.avgApr));
           setLastScan(new Date());
@@ -665,6 +726,44 @@ export default function RankingTab({ config }) {
         });
       }
 
+      // Phase B: Aster×ByBit pairs from Aster Comparison API (no ByBit direct calls)
+      for (const [sym, comp] of Object.entries(asterCompMap)) {
+        const absAvg = Math.abs(comp.avgSpread);
+        if (absAvg < 0.01) continue;
+        const shortDex    = comp.avgSpread >= 0 ? "Aster" : "ByBit";
+        const longDex     = comp.avgSpread >= 0 ? "ByBit" : "Aster";
+        const pctPositive = 0.75;
+        const stability   = 0.6;
+        const score       = calcHistoricalScore(absAvg, pctPositive, stability);
+        results.push({
+          symbol:          sym,
+          shortDex,        longDex,
+          otherDex:        "ByBit (via Aster)",
+          sourceType:      "AsterComp",
+          avgApr:          absAvg,
+          pctPositive,
+          stdDev:          0,
+          stability,
+          consecutiveDays: 0,
+          n:               365,
+          currentSpread:   Math.abs(comp.currentSpread),
+          currentHlApr:    comp.asterApr,
+          otherFundingApr: comp.bybitApr,
+          hlVol:           comp.vol24h,
+          otherVol:        comp.vol24h,
+          vol:             comp.vol24h,
+          score,
+          stabilityLabel: "Media*",
+          stabilityColor: T.yellow,
+          allPairs: [],
+          allDex: [
+            { name: "Aster", fundingApr: comp.asterApr, vol24h: comp.vol24h, price: 0, oi: 0 },
+            { name: "ByBit", fundingApr: comp.bybitApr, vol24h: comp.vol24h, price: 0, oi: 0 },
+          ],
+        });
+      }
+      console.log(`[scan] Phase B: ${Object.keys(asterCompMap).length} pares Aster×ByBit añadidos`);
+
       saveCache(results);
       setCacheTime(null);
       setDiscarded(discardedList.sort((a, b) => a.symbol.localeCompare(b.symbol)));
@@ -736,7 +835,8 @@ export default function RankingTab({ config }) {
         padding: "10px 14px", fontSize: 12, color: "#0369a1",
       }}>
         APR estimado con histórico real 30d: HL×dYdX usa spread período a período (más preciso).
-        HL×Aster y HL×Backpack usan tasa actual del DEX como referencia fija. El spread real puede variar.
+        HL×Aster y HL×Backpack usan tasa actual del DEX como referencia fija.
+        Pares Aster×ByBit (🔶) usan la media 1Y de la API de comparación de Aster — estabilidad estimada.
       </div>
 
       {/* ── Error ── */}
@@ -821,10 +921,12 @@ export default function RankingTab({ config }) {
             // HOY: ≥80% de la media → verde | 40-80% → amarillo | <40% → rojo
             const todayRatio = r.avgApr > 0 ? r.currentSpread / r.avgApr : 0;
             const todayColor = todayRatio >= 0.8 ? T.green : todayRatio >= 0.4 ? T.yellow : T.red;
-            const tooltip    = `Basado en ${r.n} períodos HL + tasa actual ${r.otherDex}`;
+            const tooltip    = r.sourceType === "AsterComp"
+              ? `Media anual 1Y spread Aster vs ByBit (datos Aster Comparison API)`
+              : `Basado en ${r.n} períodos HL + tasa actual ${r.otherDex}`;
 
             return (
-              <div key={r.symbol}>
+              <div key={r.symbol + "_" + r.shortDex + "_" + r.longDex}>
                 <div
                   onClick={() => setSelected(isSelect ? null : r)}
                   title={tooltip}
@@ -912,7 +1014,7 @@ export default function RankingTab({ config }) {
                             {d.fundingApr > 0 ? "+" : ""}{d.fundingApr?.toFixed(2)}%
                           </div>
                           <div style={{ color: T.subtle, fontSize: 10 }}>Vol ${(d.vol24h / 1e6).toFixed(1)}M</div>
-                          <div style={{ color: T.subtle, fontSize: 10 }}>OI: {d.name === "Aster" ? "N/D" : d.oi > 0 ? `$${(d.oi / 1e6).toFixed(1)}M` : "N/D"}</div>
+                          <div style={{ color: T.subtle, fontSize: 10 }}>OI: {(d.name === "Aster" || d.name === "ByBit") ? "N/D" : d.oi > 0 ? `$${(d.oi / 1e6).toFixed(1)}M` : "N/D"}</div>
                           {d.name === r.shortDex && <div style={{ color: T.red,   fontSize: 10, fontWeight: 700, marginTop: 4 }}>← SHORT (hoy)</div>}
                           {d.name === r.longDex  && <div style={{ color: T.green, fontSize: 10, fontWeight: 700, marginTop: 4 }}>← LONG (hoy)</div>}
                         </div>
@@ -951,22 +1053,35 @@ export default function RankingTab({ config }) {
                     )}
 
                     {/* Gráfico histórico */}
-                    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16 }}>
-                      <div style={{ color: T.muted, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
-                        FUNDING DELTA (APR) — {r.symbol} · {r.shortDex} SHORT / {r.longDex} LONG
+                    {r.sourceType === "AsterComp" ? (
+                      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16 }}>
+                        <div style={{ color: T.muted, fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                          ASTER × BYBIT — DATOS COMPARACIÓN ANUAL
+                        </div>
+                        <div style={{ color: T.subtle, fontSize: 12 }}>
+                          Spread obtenido de la API de comparación de Aster (media 1Y · spread actual 1D).
+                          No se dispone de datos por período individual para graficar.
+                          Estabilidad y % positivos son estimaciones conservadoras.
+                        </div>
                       </div>
-                      <div style={{ color: T.subtle, fontSize: 11, marginBottom: 4 }}>
-                        {(r.otherDex === "dYdX" || r.otherDex === "Aster")
-                          ? `Spread real período a período: HL histórico vs ${r.otherDex} histórico (${r.n} puntos alineados)`
-                          : `HL histórico vs tasa actual ${r.otherDex} (${r.otherFundingApr?.toFixed(2)}% fija como referencia)`}
+                    ) : (
+                      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16 }}>
+                        <div style={{ color: T.muted, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
+                          FUNDING DELTA (APR) — {r.symbol} · {r.shortDex} SHORT / {r.longDex} LONG
+                        </div>
+                        <div style={{ color: T.subtle, fontSize: 11, marginBottom: 4 }}>
+                          {(r.otherDex === "dYdX" || r.otherDex === "Aster")
+                            ? `Spread real período a período: HL histórico vs ${r.otherDex} histórico (${r.n} puntos alineados)`
+                            : `HL histórico vs tasa actual ${r.otherDex} (${r.otherFundingApr?.toFixed(2)}% fija como referencia)`}
+                        </div>
+                        <SpreadChart
+                          symbol={r.symbol}
+                          shortDex={r.shortDex}
+                          otherFundingApr={r.otherFundingApr}
+                          otherDex={r.otherDex}
+                        />
                       </div>
-                      <SpreadChart
-                        symbol={r.symbol}
-                        shortDex={r.shortDex}
-                        otherFundingApr={r.otherFundingApr}
-                        otherDex={r.otherDex}
-                      />
-                    </div>
+                    )}
                   </div>
                 )}
               </div>
