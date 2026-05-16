@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 
-const PROXY = "https://cors-proxy.munichbro69.workers.dev";
+const PROXY     = "https://cors-proxy.munichbro69.workers.dev";
 const HL_API    = "https://api.hyperliquid.xyz/info";
 const ASTER_API = "https://fapi.asterdex.com";
 const BACK_API  = "https://api.backpack.exchange/api/v1";
@@ -14,74 +14,63 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX = 300000;
+const CACHE_KEY  = "fundingArb_ranking30d_v2";
+const CACHE_TTL  = 6 * 3600 * 1000;
+const TOP_N      = 20;
 const TIMEFRAMES = ["24h", "3d", "7d", "15d", "31d"];
 
+// ─── Score helpers ────────────────────────────────────────────────────────────
+
 function getCls(score) {
-  if (score >= 80) return { label: "TOP",   color: T.green,  bg: T.greenBg, emoji: "🔥" };
-  if (score >= 65) return { label: "GOOD",  color: T.green,  bg: T.greenBg, emoji: "🟢" };
-  if (score >= 50) return { label: "OK",    color: T.yellow, bg: "#fef3c7", emoji: "🟡" };
-  return              { label: "AVOID", color: T.red,    bg: T.redBg,   emoji: "🔴" };
+  if (score >= 80) return { label: "TOP",   color: T.green,  bg: T.greenBg };
+  if (score >= 65) return { label: "GOOD",  color: T.green,  bg: T.greenBg };
+  if (score >= 50) return { label: "OK",    color: T.yellow, bg: "#fef3c7" };
+  return              { label: "AVOID", color: T.red,    bg: T.redBg   };
 }
 
-function calcScore({ spreadApr, spreadPct, vol, oi }) {
-  const fs = Math.min(Math.abs(spreadApr) / 100, 1) * 40;
-  const ss = Math.max(0, 1 - spreadPct / 0.005) * 20;
-  const vs = Math.min(Math.log10(Math.max(vol, 1)) / 8, 1) * 25;
-  if (oi > 0) {
-    const os = Math.min(Math.log10(oi) / 8, 1) * 15;
-    return Math.min(100, Math.max(0, Math.round(fs + ss + vs + os)));
-  }
-  return Math.min(100, Math.max(0, Math.round((fs + ss + vs) * 100 / 85)));
+// 40% media APR · 35% % días positivos · 25% estabilidad (inverso stdDev)
+function calcHistoricalScore(avgApr, pctPositive, stdDev) {
+  const aprScore  = Math.min(Math.max(avgApr, 0) / 100, 1) * 40;
+  const pctScore  = pctPositive * 35;
+  const stabScore = Math.max(0, 1 - stdDev / 100) * 25;
+  return Math.min(100, Math.max(0, Math.round(aprScore + pctScore + stabScore)));
 }
 
-function generatePairs(available) {
-  const pairs = [];
-  for (let i = 0; i < available.length; i++) {
-    for (let j = i + 1; j < available.length; j++) {
-      const a = available[i], b = available[j];
-      const shortDex = a.fundingApr >= b.fundingApr ? a : b;
-      const longDex  = a.fundingApr >= b.fundingApr ? b : a;
-
-      // Per-DEX vol check: $0 or below MIN_VOL_PER_DEX → discard with reason
-      const lowVolDex = shortDex.vol24h === 0 ? shortDex
-        : longDex.vol24h === 0 ? longDex
-        : shortDex.vol24h < MIN_VOL_PER_DEX ? shortDex
-        : longDex.vol24h < MIN_VOL_PER_DEX ? longDex
-        : null;
-      if (lowVolDex) {
-        const volStr = lowVolDex.vol24h === 0 ? "$0" : `$${(lowVolDex.vol24h / 1000).toFixed(0)}K`;
-        pairs.push({ shortDex, longDex, discardReason: `Vol insuficiente en ${lowVolDex.name} (${volStr})` });
-        continue;
-      }
-
-      const spreadApr = shortDex.fundingApr - longDex.fundingApr;
-      if (spreadApr < 1) continue;
-      const priceDiff = shortDex.price > 0 && longDex.price > 0
-        ? Math.abs((shortDex.price - longDex.price) / shortDex.price) * 100 : 99;
-      if (priceDiff > 2) continue;
-      const vol = Math.min(shortDex.vol24h, longDex.vol24h);
-      const spreadPct = Math.max(shortDex.spreadPct || 0, longDex.spreadPct || 0);
-      const oi = Math.min(shortDex.oi || 0, longDex.oi || 0);
-      const score = calcScore({ spreadApr, spreadPct, vol, oi });
-      pairs.push({ shortDex, longDex, spreadApr, priceDiff, vol, spreadPct, oi, score, discardReason: null });
-    }
-  }
-  return pairs;
+// spreads[i] = hlApr_i - otherFundingApr
+// Se orienta para que "positivo" siempre signifique "la estrategia gana"
+function calcHistoricalMetrics(hlHistory, otherFundingApr) {
+  if (!hlHistory || hlHistory.length < 5) return null;
+  const raw = hlHistory.map(d =>
+    parseFloat(d.fundingRate) * 3 * 365 * 100 - otherFundingApr
+  );
+  const n      = raw.length;
+  const rawAvg = raw.reduce((a, b) => a + b, 0) / n;
+  const hlIsShort = rawAvg >= 0;
+  const s      = hlIsShort ? raw : raw.map(v => -v);
+  const avgApr = Math.abs(rawAvg);
+  const pctPos = s.filter(v => v > 0).length / n;
+  const stdDev = Math.sqrt(s.reduce((a, v) => a + (v - avgApr) ** 2, 0) / n);
+  let consec = 0;
+  for (let i = s.length - 1; i >= 0; i--) { if (s[i] > 0) consec++; else break; }
+  return { avgApr, pctPositive: pctPos, stdDev, consecutiveDays: Math.floor(consec / 3), n, hlIsShort };
 }
 
-function getWinReason(winner, allPairs) {
-  if (allPairs.length <= 1) return "Único par";
-  const byApr = allPairs.reduce((best, p) => p.spreadApr > best.spreadApr ? p : best, allPairs[0]);
-  const sameAsPureApr =
-    winner.shortDex.name === byApr.shortDex.name &&
-    winner.longDex.name  === byApr.longDex.name;
-  if (sameAsPureApr) return "Mayor APR";
-  const reasons = [];
-  if (winner.oi > 0 && (byApr.oi === 0 || winner.oi > byApr.oi * 1.2)) reasons.push("OI↑");
-  if (winner.vol > byApr.vol * 1.2) reasons.push("Vol↑");
-  if (byApr.spreadPct > 0 && winner.spreadPct < byApr.spreadPct * 0.85) reasons.push("Sprd↓");
-  return reasons.length ? reasons.join("+") : "Score≈";
+// ─── Cache ───────────────────────────────────────────────────────────────────
+
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    if (Date.now() - ts > CACHE_TTL) return null;
+    return { ts, data };
+  } catch { return null; }
 }
+function saveCache(data) {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data })); } catch {}
+}
+
+// ─── Network ─────────────────────────────────────────────────────────────────
 
 async function proxyGet(url) {
   const res = await fetch(`${PROXY}?url=${encodeURIComponent(url)}`);
@@ -108,12 +97,10 @@ async function fetchHL() {
     const price = parseFloat(mids[a.name] || ctx?.markPx || 0);
     if (!price) return;
     map[a.name] = {
-      dex: "HL",
       fundingApr: parseFloat(ctx?.funding || 0) * 3 * 365 * 100,
       price,
       vol24h:    parseFloat(ctx?.dayNtlVlm || 0),
       oi:        parseFloat(ctx?.openInterest || 0) * price,
-      spreadPct: price > 0 ? (parseFloat(ctx?.impactPxs?.[1] || price*1.001) - parseFloat(ctx?.impactPxs?.[0] || price*0.999)) / price : 0,
     };
   });
   return map;
@@ -124,41 +111,24 @@ async function fetchAster() {
     proxyGet(`${ASTER_API}/fapi/v1/premiumIndex`),
     proxyGet(`${ASTER_API}/fapi/v1/ticker/24hr`),
   ]);
-  const tickerMap = {};
-  (Array.isArray(tickers) ? tickers : []).forEach(t => { if (t.symbol) tickerMap[t.symbol] = t; });
-
   const premMap = {};
   (Array.isArray(prem) ? prem : []).forEach(p => { if (p.symbol) premMap[p.symbol] = p; });
-
   const map = {};
   (Array.isArray(tickers) ? tickers : []).forEach(t => {
     if (!t.symbol) return;
-    const sym     = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
-    const p       = premMap[t.symbol] || {};
-    const markPx  = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
-    const indexPx = parseFloat(p.indexPrice || p.indexPx || 0);
+    const sym    = t.symbol.replace(/USDT$/, "").replace(/BUSD$/, "");
+    const p      = premMap[t.symbol] || {};
+    const markPx = parseFloat(p.markPrice || p.p || t.lastPrice || t.weightedAvgPrice || 0);
+    const idxPx  = parseFloat(p.indexPrice || p.indexPx || 0);
     if (!markPx) return;
-
-    // Aster pays funding every 4 h (6×/day). Use lastFundingRate (actual paid rate);
-    // avoid fundingRate/interestRate fields which are the fixed 0.0001 interest component.
-    // When lastFundingRate is absent, estimate from mark-index premium (±0.75% cap).
     const lastRate   = parseFloat(p.lastFundingRate || 0);
-    const premium    = indexPx > 0 ? (markPx - indexPx) / indexPx : 0;
-    const fundingRate = lastRate !== 0
-      ? lastRate
-      : Math.max(-0.0075, Math.min(0.0075, premium));
-
-    const oi = parseFloat(p.openInterest || 0) * markPx;
-
-    const bid = parseFloat(t.bidPrice || markPx * 0.999);
-    const ask = parseFloat(t.askPrice || markPx * 1.001);
+    const premium    = idxPx > 0 ? (markPx - idxPx) / idxPx : 0;
+    const fundingRate = lastRate !== 0 ? lastRate : Math.max(-0.0075, Math.min(0.0075, premium));
     map[sym] = {
-      dex: "Aster",
       fundingApr: fundingRate * 6 * 365 * 100,
-      price:     markPx,
-      vol24h:    parseFloat(t.quoteVolume || 0),
-      oi,
-      spreadPct: markPx > 0 ? (ask - bid) / markPx : 0,
+      price: markPx,
+      vol24h: parseFloat(t.quoteVolume || 0),
+      oi: parseFloat(p.openInterest || 0) * markPx,
     };
   });
   return map;
@@ -171,9 +141,7 @@ async function fetchBackpack() {
       proxyGet(`${BACK_API}/fundingRates`).catch(() => []),
     ]);
     const fundingMap = {};
-    (Array.isArray(fundingRes) ? fundingRes : []).forEach(f => {
-      if (f.symbol) fundingMap[f.symbol] = f;
-    });
+    (Array.isArray(fundingRes) ? fundingRes : []).forEach(f => { if (f.symbol) fundingMap[f.symbol] = f; });
     const map = {};
     (Array.isArray(tickerRes) ? tickerRes : []).forEach(t => {
       if (!t.symbol?.endsWith("_PERP")) return;
@@ -182,76 +150,90 @@ async function fetchBackpack() {
       if (!price) return;
       const fr = fundingMap[t.symbol] || {};
       map[sym] = {
-        dex: "Backpack",
         fundingApr: parseFloat(fr.fundingRate || fr.lastFundingRate || 0) * 3 * 365 * 100,
         price,
-        vol24h: parseFloat(t.quoteVolume) || parseFloat(t.volume || 0) * parseFloat(t.lastPrice || 0),
-        oi:     0,
-        spreadPct: 0,
+        vol24h: parseFloat(t.quoteVolume) || parseFloat(t.volume || 0) * price,
+        oi: 0,
       };
     });
     return map;
   } catch { return {}; }
 }
 
+// Histórico simple para el gráfico de detalle (sin paginación, variable timeframe)
 async function fetchHLHistory(symbol, days) {
   try {
-    const now   = Date.now();
-    const start = now - days * 86400000;
-    const candles = await proxyPost(HL_API, {
-      type: "fundingHistory",
-      coin: symbol,
-      startTime: start,
-    });
+    const start   = Date.now() - days * 86400000;
+    const candles = await proxyPost(HL_API, { type: "fundingHistory", coin: symbol, startTime: start });
     return Array.isArray(candles) ? candles : [];
   } catch { return []; }
 }
 
-function SpreadChart({ symbol, shortDex, hlMap, asterMap, backMap }) {
+// Histórico 30d con paginación para el ranking
+async function fetchHLHistory30d(symbol) {
+  const now = Date.now(), start = now - 30 * 86400000;
+  let all = [], cursor = start;
+  for (let page = 0; page < 10; page++) {
+    const batch = await proxyPost(HL_API, { type: "fundingHistory", coin: symbol, startTime: cursor });
+    if (!Array.isArray(batch) || !batch.length) break;
+    all = all.concat(batch);
+    if (batch.length < 500) break;
+    cursor = batch[batch.length - 1].time + 1;
+    if (cursor >= now) break;
+  }
+  return all;
+}
+
+// ─── SpreadChart ──────────────────────────────────────────────────────────────
+
+function SpreadChart({ symbol, shortDex, otherFundingApr }) {
   const [tf, setTf]           = useState("7d");
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    setLoading(true);
-    const days = tf === "24h" ? 1 : tf === "3d" ? 3 : tf === "7d" ? 7 : tf === "15d" ? 15 : 31;
+  const load = useCallback((newTf) => {
+    setTf(newTf); setLoading(true);
+    const days = newTf === "24h" ? 1 : newTf === "3d" ? 3 : newTf === "7d" ? 7 : newTf === "15d" ? 15 : 31;
     fetchHLHistory(symbol, days).then(data => {
-      const otherFunding = shortDex === "HL"
-        ? (asterMap[symbol]?.fundingApr || backMap[symbol]?.fundingApr || 0)
-        : (hlMap[symbol]?.fundingApr || 0);
-      const points = data.map(d => ({
-        ts:        d.time,
-        spreadApr: parseFloat(d.fundingRate) * 3 * 365 * 100 - (shortDex === "HL" ? otherFunding : -otherFunding),
-      })).filter(p => !isNaN(p.spreadApr));
+      const other = otherFundingApr ?? 0;
+      const points = data.map(d => {
+        const hlApr = parseFloat(d.fundingRate) * 3 * 365 * 100;
+        return {
+          ts: d.time,
+          spreadApr: shortDex === "HL" ? hlApr - other : other - hlApr,
+        };
+      }).filter(p => !isNaN(p.spreadApr));
       setHistory(points);
       setLoading(false);
     });
-  }, [symbol, tf]);
+  }, [symbol, shortDex, otherFundingApr]);
+
+  useEffect(() => { load(tf); }, [symbol, shortDex, otherFundingApr]);
 
   const W = 580, H = 180;
   const PAD = { top: 12, right: 12, bottom: 28, left: 44 };
   const IW = W - PAD.left - PAD.right;
   const IH = H - PAD.top - PAD.bottom;
-  const vals  = history.map(h => h.spreadApr);
-  const avg   = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-  const max   = vals.length > 0 ? Math.max(...vals, 0) : 100;
-  const min   = vals.length > 0 ? Math.min(...vals, 0) : 0;
-  const yMax  = max + Math.abs(max - min) * 0.15 + 5;
-  const yMin  = Math.min(min - 2, 0);
-  const toY   = v => PAD.top + IH - ((v - yMin) / (yMax - yMin)) * IH;
-  const barW  = Math.max(2, IW / Math.max(history.length, 1) - 1);
-  const avgY  = toY(avg);
+  const vals = history.map(h => h.spreadApr);
+  const avg  = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  const max  = vals.length ? Math.max(...vals, 0) : 100;
+  const min  = vals.length ? Math.min(...vals, 0) : 0;
+  const yMax = max + Math.abs(max - min) * 0.15 + 5;
+  const yMin = Math.min(min - 2, 0);
+  const toY  = v => PAD.top + IH - ((v - yMin) / (yMax - yMin)) * IH;
+  const barW = Math.max(2, IW / Math.max(history.length, 1) - 1);
+  const avgY = toY(avg);
 
   return (
     <div style={{ marginTop: 16 }}>
       <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
         {TIMEFRAMES.map(t => (
-          <button key={t} onClick={() => setTf(t)} style={{
+          <button key={t} onClick={() => load(t)} style={{
             background: tf === t ? T.green : T.bg,
             border: `1px solid ${tf === t ? T.green : T.border}`,
             color: tf === t ? "#fff" : T.muted,
             borderRadius: 6, padding: "4px 10px",
-            cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 600
+            cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 600,
           }}>{t}</button>
         ))}
       </div>
@@ -259,7 +241,7 @@ function SpreadChart({ symbol, shortDex, hlMap, asterMap, backMap }) {
         <div><div style={{ color: T.subtle, fontSize: 10 }}>Media APR</div><div style={{ color: T.blue, fontSize: 18, fontWeight: 800 }}>{avg.toFixed(1)}%</div></div>
         <div><div style={{ color: T.subtle, fontSize: 10 }}>Máximo</div><div style={{ color: T.green, fontSize: 18, fontWeight: 800 }}>{max.toFixed(1)}%</div></div>
         <div><div style={{ color: T.subtle, fontSize: 10 }}>Mínimo</div><div style={{ color: T.red, fontSize: 18, fontWeight: 800 }}>{min.toFixed(1)}%</div></div>
-        <div><div style={{ color: T.subtle, fontSize: 10 }}>% positivos</div><div style={{ color: T.text, fontSize: 18, fontWeight: 800 }}>{vals.length > 0 ? (vals.filter(v => v > 0).length / vals.length * 100).toFixed(0) : 0}%</div></div>
+        <div><div style={{ color: T.subtle, fontSize: 10 }}>% positivos</div><div style={{ color: T.text, fontSize: 18, fontWeight: 800 }}>{vals.length ? (vals.filter(v => v > 0).length / vals.length * 100).toFixed(0) : 0}%</div></div>
       </div>
       {loading ? (
         <div style={{ color: T.subtle, fontSize: 13, textAlign: "center", padding: 20 }}>Cargando histórico...</div>
@@ -270,7 +252,7 @@ function SpreadChart({ symbol, shortDex, hlMap, asterMap, backMap }) {
           <svg width={W} height={H} style={{ display: "block" }}>
             {[0, 25, 50, 75, 100].map(p => {
               const v = yMin + (yMax - yMin) * p / 100, y = toY(v);
-              return <g key={p}><line x1={PAD.left} y1={y} x2={W-PAD.right} y2={y} stroke={T.border} strokeWidth={1}/><text x={PAD.left-6} y={y+4} fill={T.subtle} fontSize={9} textAnchor="end">{v.toFixed(0)}%</text></g>;
+              return <g key={p}><line x1={PAD.left} y1={y} x2={W - PAD.right} y2={y} stroke={T.border} strokeWidth={1}/><text x={PAD.left - 6} y={y + 4} fill={T.subtle} fontSize={9} textAnchor="end">{v.toFixed(0)}%</text></g>;
             })}
             {history.map((h, i) => {
               const v = h.spreadApr;
@@ -280,12 +262,12 @@ function SpreadChart({ symbol, shortDex, hlMap, asterMap, backMap }) {
               const color = v >= 50 ? T.green : v >= 20 ? "#34d399" : v > 0 ? "#6ee7b7" : T.red;
               return <rect key={i} x={x} y={barTop} width={barW} height={barH} fill={color} rx={1} opacity={0.85}/>;
             })}
-            <line x1={PAD.left} y1={avgY} x2={W-PAD.right} y2={avgY} stroke={T.blue} strokeWidth={2} strokeDasharray="8,5"/>
-            <rect x={W-PAD.right-48} y={avgY-10} width={44} height={16} rx={4} fill="#dbeafe"/>
-            <text x={W-PAD.right-26} y={avgY+2} fill={T.blue} fontSize={9} textAnchor="middle" fontWeight="700">{avg.toFixed(1)}%</text>
-            {[0, Math.floor(history.length/2), history.length-1].map(i => i < history.length && (
-              <text key={i} x={PAD.left+(i/history.length)*IW+barW/2} y={H-PAD.bottom+14} fill={T.subtle} fontSize={8} textAnchor="middle">
-                {new Date(history[i].ts).toLocaleDateString([],{month:"short",day:"numeric"})}
+            <line x1={PAD.left} y1={avgY} x2={W - PAD.right} y2={avgY} stroke={T.blue} strokeWidth={2} strokeDasharray="8,5"/>
+            <rect x={W - PAD.right - 48} y={avgY - 10} width={44} height={16} rx={4} fill="#dbeafe"/>
+            <text x={W - PAD.right - 26} y={avgY + 2} fill={T.blue} fontSize={9} textAnchor="middle" fontWeight="700">{avg.toFixed(1)}%</text>
+            {[0, Math.floor(history.length / 2), history.length - 1].map(i => i < history.length && (
+              <text key={i} x={PAD.left + (i / history.length) * IW + barW / 2} y={H - PAD.bottom + 14} fill={T.subtle} fontSize={8} textAnchor="middle">
+                {new Date(history[i].ts).toLocaleDateString([], { month: "short", day: "numeric" })}
               </text>
             ))}
           </svg>
@@ -295,6 +277,8 @@ function SpreadChart({ symbol, shortDex, hlMap, asterMap, backMap }) {
   );
 }
 
+// ─── Main component ───────────────────────────────────────────────────────────
+
 export default function RankingTab({ config }) {
   const [results, setResults]     = useState([]);
   const [loading, setLoading]     = useState(false);
@@ -302,23 +286,19 @@ export default function RankingTab({ config }) {
   const [lastScan, setLastScan]   = useState(null);
   const [selected, setSelected]   = useState(null);
   const [dexStatus, setDexStatus] = useState({});
-  const [maps, setMaps]           = useState({});
-  const [debugInfo, setDebugInfo] = useState("");
+  const [progress, setProgress]   = useState({ step: 0, total: 0, current: "" });
+  const [cacheTime, setCacheTime] = useState(null);
   const [discarded, setDiscarded] = useState([]);
 
-  const runScan = useCallback(async () => {
-    setLoading(true); setError(null); setSelected(null); setDebugInfo("");
+  const runScan = useCallback(async (forceRefresh = false) => {
+    setLoading(true); setError(null); setSelected(null);
+    setProgress({ step: 0, total: 0, current: "Cargando datos de DEX..." });
+
     try {
+      // Siempre cargar datos actuales (vol, spread hoy, confirmar par activo)
       const [hlMap, asterMap, backMap] = await Promise.allSettled([
-        fetchHL(), fetchAster(), fetchBackpack()
+        fetchHL(), fetchAster(), fetchBackpack(),
       ]).then(r => r.map(x => x.status === "fulfilled" ? x.value : {}));
-
-      setMaps({ hlMap, asterMap, backMap });
-
-      const hlSample   = ["BTC","ETH","SOL"].map(s => hlMap[s]   ? `${s}:$${(hlMap[s].vol24h/1e6).toFixed(1)}M fr${hlMap[s].fundingApr.toFixed(2)}%`   : `${s}:miss`).join(" ");
-      const backSample = ["BTC","ETH","SOL"].map(s => backMap[s] ? `${s}:$${(backMap[s].vol24h/1e6).toFixed(1)}M fr${backMap[s].fundingApr.toFixed(2)}%` : `${s}:miss`).join(" ");
-      const asterCount = Object.keys(asterMap).length;
-      setDebugInfo(`HL: ${hlSample} | BP: ${backSample} | Aster:${asterCount}`);
 
       setDexStatus({
         HL:       Object.keys(hlMap).length,
@@ -326,74 +306,148 @@ export default function RankingTab({ config }) {
         Backpack: Object.keys(backMap).length,
       });
 
-      const allDexMaps = [
-        { name: "HL",       map: hlMap },
-        { name: "Aster",    map: asterMap },
-        { name: "Backpack", map: backMap },
-      ];
+      // Intentar caché (evita re-descargar 30d de histórico)
+      if (!forceRefresh) {
+        const cached = loadCache();
+        if (cached) {
+          // Actualizar spread hoy y vol actuales sobre el histórico cacheado
+          const updated = cached.data.map(r => {
+            const hlVol    = hlMap[r.symbol]?.vol24h   || 0;
+            const otherVol = r.otherDex === "Aster"
+              ? asterMap[r.symbol]?.vol24h || 0
+              : backMap[r.symbol]?.vol24h  || 0;
+            const hlApr  = hlMap[r.symbol]?.fundingApr    || 0;
+            const othApr = r.otherDex === "Aster"
+              ? asterMap[r.symbol]?.fundingApr || 0
+              : backMap[r.symbol]?.fundingApr  || 0;
+            const currentSpread = r.shortDex === "HL" ? hlApr - othApr : othApr - hlApr;
+            return { ...r, hlVol, otherVol, vol: Math.min(hlVol, otherVol), currentSpread, currentHlApr: hlApr, otherFundingApr: othApr };
+          }).filter(r => r.hlVol >= MIN_VOL_PER_DEX && r.otherVol >= MIN_VOL_PER_DEX);
 
-      const results = [];
+          setResults(updated.sort((a, b) => b.score - a.score));
+          setLastScan(new Date());
+          setCacheTime(new Date(cached.ts));
+          return;
+        }
+      }
+
+      // Top 20 HL por vol 24h
+      const top20 = Object.entries(hlMap)
+        .sort((a, b) => b[1].vol24h - a[1].vol24h)
+        .slice(0, TOP_N)
+        .map(([sym]) => sym);
+
+      setProgress({ step: 0, total: top20.length, current: "" });
+
+      const results     = [];
       const discardedList = [];
-      let filteredByVol = 0;
 
-      for (const sym of Object.keys(hlMap)) {
-        const available = allDexMaps
-          .filter(d => d.map[sym])
-          .map(d => ({ name: d.name, ...d.map[sym] }));
-        if (available.length < 2) continue;
+      for (let i = 0; i < top20.length; i++) {
+        const sym = top20[i];
+        setProgress({ step: i + 1, total: top20.length, current: sym });
 
-        const pairs = generatePairs(available);
-        const validPairs    = pairs.filter(p => !p.discardReason && p.score !== undefined);
-        const rejectedPairs = pairs.filter(p => p.discardReason);
+        const hlVol = hlMap[sym]?.vol24h || 0;
 
-        if (validPairs.length === 0) {
-          filteredByVol++;
-          if (rejectedPairs.length > 0) {
-            const reason = rejectedPairs.find(p => p.discardReason.includes("$0"))?.discardReason
-              || rejectedPairs[0].discardReason;
-            discardedList.push({ symbol: sym, reason });
+        // DEX contrapartes con vol suficiente
+        const candidates = [];
+        if ((asterMap[sym]?.vol24h || 0) >= MIN_VOL_PER_DEX)  candidates.push({ name: "Aster",    ...asterMap[sym] });
+        if ((backMap[sym]?.vol24h  || 0) >= MIN_VOL_PER_DEX)  candidates.push({ name: "Backpack", ...backMap[sym] });
+
+        if (candidates.length === 0) {
+          const lowDex = asterMap[sym] ? ["Aster", asterMap[sym]] : backMap[sym] ? ["Backpack", backMap[sym]] : null;
+          if (lowDex) {
+            const [dex, d] = lowDex;
+            discardedList.push({ symbol: sym, reason: `Vol insuf. en ${dex} ($${((d.vol24h || 0) / 1000).toFixed(0)}K)` });
           }
           continue;
         }
 
-        const winner = validPairs.reduce((best, p) => p.score > best.score ? p : best, validPairs[0]);
-        const winReason = getWinReason(winner, validPairs);
+        // Descargar histórico 30d de HL una sola vez por token
+        const hlHistory = await fetchHLHistory30d(sym);
+        if (hlHistory.length < 10) {
+          discardedList.push({ symbol: sym, reason: "Sin histórico HL suficiente" });
+          continue;
+        }
+
+        // Evaluar cada par (HL × Aster, HL × Backpack)
+        const pairsWithMetrics = [];
+        for (const other of candidates) {
+          const metrics = calcHistoricalMetrics(hlHistory, other.fundingApr);
+          if (!metrics) continue;
+
+          // Filtros duros históricos
+          if (metrics.avgApr      < 5)    continue;
+          if (metrics.pctPositive < 0.60) continue;
+
+          const shortDex      = metrics.hlIsShort ? "HL" : other.name;
+          const longDex       = metrics.hlIsShort ? other.name : "HL";
+          const hlCurApr      = hlMap[sym]?.fundingApr || 0;
+          const currentSpread = metrics.hlIsShort ? hlCurApr - other.fundingApr : other.fundingApr - hlCurApr;
+          const score         = calcHistoricalScore(metrics.avgApr, metrics.pctPositive, metrics.stdDev);
+
+          pairsWithMetrics.push({
+            shortDex, longDex, otherDex: other.name,
+            otherFundingApr: other.fundingApr, otherVol24h: other.vol24h,
+            currentSpread, currentHlApr: hlCurApr,
+            score, ...metrics,
+          });
+        }
+
+        if (pairsWithMetrics.length === 0) {
+          discardedList.push({ symbol: sym, reason: "Media APR < 5% o positivos < 60% en 30d" });
+          continue;
+        }
+
+        const winner    = pairsWithMetrics.reduce((b, p) => p.score > b.score ? p : b, pairsWithMetrics[0]);
+        const stabRatio = Math.max(0, 1 - winner.stdDev / 100);
 
         results.push({
           symbol: sym,
-          shortDex: winner.shortDex.name, longDex: winner.longDex.name,
-          shortFunding: winner.shortDex.fundingApr, longFunding: winner.longDex.fundingApr,
-          shortPrice: winner.shortDex.price, longPrice: winner.longDex.price,
-          spreadApr: winner.spreadApr, priceDiff: winner.priceDiff,
-          spreadPct: winner.spreadPct, vol: winner.vol, oi: winner.oi, score: winner.score,
-          dexCount: available.length,
-          allDex: available,
-          winReason,
-          allPairs: validPairs,
+          shortDex: winner.shortDex, longDex: winner.longDex, otherDex: winner.otherDex,
+          avgApr: winner.avgApr, pctPositive: winner.pctPositive, stdDev: winner.stdDev,
+          consecutiveDays: winner.consecutiveDays, n: winner.n,
+          currentSpread: winner.currentSpread, currentHlApr: winner.currentHlApr,
+          otherFundingApr: winner.otherFundingApr,
+          hlVol, otherVol: winner.otherVol24h,
+          vol: Math.min(hlVol, winner.otherVol24h),
+          score: winner.score,
+          stability: stabRatio > 0.7 ? "Alta" : stabRatio > 0.4 ? "Media" : "Baja",
+          stabilityColor: stabRatio > 0.7 ? T.green : stabRatio > 0.4 ? T.yellow : T.red,
+          allPairs: pairsWithMetrics,
+          allDex: [
+            { name: "HL",       fundingApr: hlMap[sym]?.fundingApr,  vol24h: hlVol,            price: hlMap[sym]?.price },
+            ...candidates.map(c => ({ name: c.name, fundingApr: c.fundingApr, vol24h: c.vol24h, price: c.price })),
+          ],
         });
       }
 
+      saveCache(results);
+      setCacheTime(null);
       setDiscarded(discardedList.sort((a, b) => a.symbol.localeCompare(b.symbol)));
-      setDebugInfo(prev => `${prev} | Filtrados por vol: ${filteredByVol} | Resultado: ${results.length}`);
       setResults(results.sort((a, b) => b.score - a.score));
       setLastScan(new Date());
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
+      setProgress({ step: 0, total: 0, current: "" });
     }
   }, []);
 
+  const progressPct = progress.total > 0 ? (progress.step / progress.total) * 100 : 0;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+
+      {/* ── Header ── */}
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <div style={{ color: T.subtle, fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            RANKING · HL × ASTER × BACKPACK · VOL MÍN $300K/DEX
+            RANKING HISTÓRICO 30d · HL × ASTER × BACKPACK
           </div>
           {lastScan && (
             <div style={{ color: T.subtle, fontSize: 12, marginTop: 4 }}>
-              {lastScan.toLocaleTimeString()} · {results.length} pares
+              Spread actual: {lastScan.toLocaleTimeString()} · {results.length} tokens
               {Object.entries(dexStatus).map(([dex, n]) => (
                 <span key={dex} style={{ marginLeft: 8, color: n > 0 ? T.green : T.red }}>
                   {n > 0 ? "✓" : "✗"}{dex}({n})
@@ -401,141 +455,256 @@ export default function RankingTab({ config }) {
               ))}
             </div>
           )}
-          {debugInfo && <div style={{ color: T.subtle, fontSize: 11, marginTop: 2 }}>{debugInfo}</div>}
+          {cacheTime && (
+            <div style={{ fontSize: 11, color: T.subtle, marginTop: 2 }}>
+              Histórico calculado: {cacheTime.toLocaleString()} ·{" "}
+              <button onClick={() => runScan(true)} disabled={loading} style={{
+                background: "none", border: "none", color: T.accent, cursor: "pointer",
+                fontFamily: "inherit", fontSize: 11, fontWeight: 600, padding: 0,
+              }}>↺ Recalcular historial</button>
+            </div>
+          )}
         </div>
-        <button onClick={runScan} disabled={loading} style={{
-          background: loading ? "#f1f5f9" : "#6366f120",
-          border: `1px solid ${loading ? T.border : "#6366f144"}`,
-          color: loading ? T.subtle : T.accent,
-          borderRadius: 10, padding: "10px 28px",
-          cursor: loading ? "not-allowed" : "pointer",
-          fontFamily: "inherit", fontSize: 14, fontWeight: 700
-        }}>
-          {loading ? "Escaneando..." : "▶ Escanear ahora"}
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {results.length > 0 && !cacheTime && (
+            <button onClick={() => runScan(false)} disabled={loading} style={{
+              background: "#f1f5f9", border: `1px solid ${T.border}`,
+              color: T.muted, borderRadius: 10, padding: "10px 18px",
+              cursor: loading ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+            }}>↻ Actualizar spread hoy</button>
+          )}
+          <button onClick={() => runScan(false)} disabled={loading} style={{
+            background: loading ? "#f1f5f9" : "#6366f120",
+            border: `1px solid ${loading ? T.border : "#6366f144"}`,
+            color: loading ? T.subtle : T.accent,
+            borderRadius: 10, padding: "10px 28px",
+            cursor: loading ? "not-allowed" : "pointer",
+            fontFamily: "inherit", fontSize: 14, fontWeight: 700,
+          }}>
+            {loading ? "Analizando..." : results.length === 0 ? "▶ Analizar 30d" : "↻ Refrescar"}
+          </button>
+        </div>
       </div>
 
-      {error && <div style={{ background: T.redBg, border: "1px solid #fca5a5", borderRadius: 12, padding: 16, color: T.red, fontSize: 14 }}>Error: {error}</div>}
+      {/* ── Nota informativa ── */}
+      <div style={{
+        background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10,
+        padding: "10px 14px", fontSize: 12, color: "#0369a1",
+      }}>
+        Score basado en histórico 30d de HL — el spread de hoy puede ser diferente.
+        La tasa de Aster/Backpack se usa como referencia fija para estimar el spread histórico.
+      </div>
 
-      {loading && (
-        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
-          <div style={{ color: T.accent, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Escaneando DEX...</div>
-          <div style={{ color: T.subtle, fontSize: 13 }}>HL · Aster · Backpack · Filtrando vol ≥ $300K/DEX</div>
+      {/* ── Error ── */}
+      {error && (
+        <div style={{ background: T.redBg, border: "1px solid #fca5a5", borderRadius: 12, padding: 16, color: T.red, fontSize: 14 }}>
+          Error: {error}
         </div>
       )}
 
+      {/* ── Progress ── */}
+      {loading && (
+        <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 24 }}>
+          {progress.total === 0 ? (
+            <div style={{ color: T.accent, fontSize: 15, fontWeight: 700, textAlign: "center" }}>
+              Cargando datos de DEX...
+            </div>
+          ) : (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                <span style={{ color: T.text, fontSize: 14, fontWeight: 700 }}>
+                  Analizando {progress.current}...
+                </span>
+                <span style={{ color: T.muted, fontSize: 13 }}>
+                  {progress.step}/{progress.total} tokens
+                </span>
+              </div>
+              <div style={{ background: T.border, borderRadius: 6, height: 8 }}>
+                <div style={{
+                  background: `linear-gradient(90deg, ${T.accent}, ${T.green})`,
+                  borderRadius: 6, height: 8,
+                  width: `${progressPct}%`,
+                  transition: "width 0.4s ease",
+                }} />
+              </div>
+              <div style={{ color: T.subtle, fontSize: 11, marginTop: 8, textAlign: "center" }}>
+                Descargando 30 días de histórico de HL · Vol mín $300K/DEX
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── Empty states ── */}
       {!loading && results.length === 0 && !error && lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
-          <div style={{ fontSize: 28, marginBottom: 12 }}>🔍</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Sin oportunidades con vol ≥ $300K/DEX ahora mismo</div>
-          <div style={{ color: T.subtle, fontSize: 13, marginTop: 6 }}>{debugInfo}</div>
+          <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
+          <div style={{ color: T.muted, fontSize: 15 }}>Sin tokens que pasen los filtros históricos (APR ≥ 5% · Positivos ≥ 60%)</div>
         </div>
       )}
-
       {!loading && results.length === 0 && !error && !lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 60, textAlign: "center" }}>
-          <div style={{ fontSize: 32, marginBottom: 12 }}>🔍</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Pulsa "Escanear ahora"</div>
-          <div style={{ color: T.subtle, fontSize: 13, marginTop: 6 }}>Solo muestra tokens con vol ≥ $300K en cada DEX del par</div>
+          <div style={{ fontSize: 36, marginBottom: 16 }}>📈</div>
+          <div style={{ color: T.muted, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Ranking basado en histórico real 30d</div>
+          <div style={{ color: T.subtle, fontSize: 13, marginBottom: 6 }}>Top 20 tokens HL por vol · Histórico HL vs tasa actual Aster/Backpack</div>
+          <div style={{ color: T.subtle, fontSize: 13 }}>Filtros: media APR ≥ 5% · % positivos ≥ 60% · Vol ≥ $300K/DEX</div>
         </div>
       )}
 
+      {/* ── Tabla de resultados ── */}
       {results.length > 0 && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,0.06)" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 90px", padding: "12px 16px", borderBottom: `1px solid ${T.border}`, background: "#f8fafc" }}>
-            {["#", "TOKEN", "SCORE", "SHORT", "LONG", "SPREAD APR", "VOL MÍN", "RAZÓN"].map(h => (
+          {/* Header */}
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "28px 76px 110px 90px 80px 70px 60px 80px",
+            padding: "12px 16px", borderBottom: `1px solid ${T.border}`, background: "#f8fafc",
+          }}>
+            {["#", "TOKEN", "PAR (30d)", "MEDIA APR", "% POSITIVOS", "ESTAB.", "SCORE", "HOY"].map(h => (
               <div key={h} style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em" }}>{h}</div>
             ))}
           </div>
+
           {results.map((r, i) => {
             const c = getCls(r.score);
             const isSelect = selected?.symbol === r.symbol;
+            const todayColor = r.currentSpread >= r.avgApr * 0.5 ? T.green : r.currentSpread > 0 ? T.yellow : T.red;
+
             return (
               <div key={r.symbol}>
                 <div onClick={() => setSelected(isSelect ? null : r)} style={{
-                  display: "grid", gridTemplateColumns: "36px 90px 64px 110px 110px 90px 90px 90px",
+                  display: "grid",
+                  gridTemplateColumns: "28px 76px 110px 90px 80px 70px 60px 80px",
                   padding: "13px 16px", borderBottom: `1px solid ${T.border}`,
                   background: isSelect ? "#f8fafc" : "white", cursor: "pointer",
                 }}>
+                  {/* # */}
                   <div style={{ color: T.subtle, fontSize: 12 }}>{i + 1}</div>
+
+                  {/* TOKEN */}
                   <div style={{ color: T.text, fontWeight: 800, fontSize: 14 }}>{r.symbol}</div>
+
+                  {/* PAR (30d) */}
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: T.text }}>
+                      {r.shortDex} → {r.longDex}
+                    </div>
+                    <div style={{ fontSize: 10, color: T.subtle }}>n={r.n} períodos</div>
+                  </div>
+
+                  {/* MEDIA APR */}
+                  <div style={{ color: T.green, fontSize: 14, fontWeight: 800 }}>
+                    +{r.avgApr.toFixed(1)}%
+                  </div>
+
+                  {/* % POSITIVOS */}
+                  <div style={{ color: r.pctPositive >= 0.75 ? T.green : r.pctPositive >= 0.60 ? T.yellow : T.red, fontSize: 13, fontWeight: 700 }}>
+                    {(r.pctPositive * 100).toFixed(0)}%
+                  </div>
+
+                  {/* ESTAB. */}
+                  <div style={{ color: r.stabilityColor, fontSize: 12, fontWeight: 700 }}>
+                    {r.stability}
+                  </div>
+
+                  {/* SCORE */}
                   <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                     <div style={{ width: 7, height: 7, borderRadius: "50%", background: c.color }} />
                     <span style={{ color: c.color, fontSize: 13, fontWeight: 700 }}>{r.score}</span>
                   </div>
-                  <div>
-                    <div style={{ color: T.red, fontSize: 12, fontWeight: 700 }}>{r.shortDex}</div>
-                    <div style={{ color: T.red, fontSize: 10 }}>{r.shortFunding?.toFixed(1)}%</div>
+
+                  {/* HOY */}
+                  <div style={{ color: todayColor, fontSize: 12, fontWeight: 700 }}>
+                    {r.currentSpread >= 0 ? "+" : ""}{r.currentSpread.toFixed(1)}%
                   </div>
-                  <div>
-                    <div style={{ color: T.green, fontSize: 12, fontWeight: 700 }}>{r.longDex}</div>
-                    <div style={{ color: T.green, fontSize: 10 }}>{r.longFunding?.toFixed(1)}%</div>
-                  </div>
-                  <div style={{ color: T.yellow, fontSize: 16, fontWeight: 800 }}>{r.spreadApr?.toFixed(1)}%</div>
-                  <div style={{ color: T.green, fontSize: 12, fontWeight: 600 }}>${(r.vol/1000).toFixed(0)}K</div>
-                  <div style={{ color: T.accent, fontSize: 10, fontWeight: 700 }}>{r.winReason}</div>
                 </div>
+
+                {/* ── Detalle expandido ── */}
                 {isSelect && (
                   <div style={{ padding: "20px", background: "#f8fafc", borderBottom: `1px solid ${T.border}` }}>
+
+                    {/* Métricas históricas principales */}
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+                      {[
+                        { label: "Media APR 30d",       value: `+${r.avgApr.toFixed(2)}%`,              color: T.green },
+                        { label: "% Períodos positivos", value: `${(r.pctPositive * 100).toFixed(1)}%`, color: r.pctPositive >= 0.75 ? T.green : T.yellow },
+                        { label: "Desv. estándar",       value: `${r.stdDev.toFixed(1)}%`,               color: T.muted },
+                        { label: "Días consec. positivos", value: `${r.consecutiveDays}d`,               color: r.consecutiveDays >= 7 ? T.green : T.muted },
+                        { label: "Spread hoy (referencia)", value: `${r.currentSpread >= 0 ? "+" : ""}${r.currentSpread.toFixed(2)}%`, color: r.currentSpread > 0 ? T.blue : T.red },
+                      ].map(({ label, value, color }) => (
+                        <div key={label} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: "10px 14px", minWidth: 130 }}>
+                          <div style={{ color: T.subtle, fontSize: 10, marginBottom: 3 }}>{label}</div>
+                          <div style={{ color, fontSize: 18, fontWeight: 800 }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Datos actuales por DEX */}
+                    <div style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 8 }}>
+                      DATOS ACTUALES POR DEX
+                    </div>
                     <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
                       {r.allDex.map(d => (
                         <div key={d.name} style={{
                           background: d.name === r.shortDex ? T.redBg : d.name === r.longDex ? T.greenBg : "#f1f5f9",
                           border: `1px solid ${d.name === r.shortDex ? "#fca5a5" : d.name === r.longDex ? "#6ee7b7" : T.border}`,
-                          borderRadius: 10, padding: "10px 14px", minWidth: 120
+                          borderRadius: 10, padding: "10px 14px", minWidth: 120,
                         }}>
                           <div style={{ color: T.muted, fontSize: 10, marginBottom: 3 }}>{d.name}</div>
-                          <div style={{ color: d.fundingApr > 0 ? T.red : T.green, fontSize: 16, fontWeight: 800 }}>
+                          <div style={{ color: d.fundingApr > 0 ? T.red : T.green, fontSize: 15, fontWeight: 800 }}>
                             {d.fundingApr > 0 ? "+" : ""}{d.fundingApr?.toFixed(2)}%
                           </div>
-                          <div style={{ color: T.subtle, fontSize: 10 }}>${d.price?.toFixed(4)}</div>
-                          <div style={{ color: T.subtle, fontSize: 10 }}>Vol ${(d.vol24h/1000).toFixed(0)}K</div>
-                          {d.name === r.shortDex && <div style={{ color: T.red, fontSize: 10, fontWeight: 700, marginTop: 4 }}>← SHORT</div>}
-                          {d.name === r.longDex  && <div style={{ color: T.green, fontSize: 10, fontWeight: 700, marginTop: 4 }}>← LONG</div>}
+                          <div style={{ color: T.subtle, fontSize: 10 }}>Vol ${(d.vol24h / 1e6).toFixed(1)}M</div>
+                          {d.name === r.shortDex && <div style={{ color: T.red,   fontSize: 10, fontWeight: 700, marginTop: 4 }}>← SHORT (hoy)</div>}
+                          {d.name === r.longDex  && <div style={{ color: T.green, fontSize: 10, fontWeight: 700, marginTop: 4 }}>← LONG (hoy)</div>}
                         </div>
                       ))}
                     </div>
-                    {r.allPairs && r.allPairs.length > 1 && (
+
+                    {/* Comparativa de pares si hay varios */}
+                    {r.allPairs.length > 1 && (
                       <div style={{ marginBottom: 16 }}>
-                        <div style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>
-                          ANÁLISIS DE PARES · ordenado por score combinado (APR + liquidez + OI)
+                        <div style={{ color: T.subtle, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", marginBottom: 8 }}>
+                          COMPARATIVA DE PARES — score histórico 30d
                         </div>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                           {[...r.allPairs].sort((a, b) => b.score - a.score).map((p, pi) => {
-                            const isWinner = p.shortDex.name === r.shortDex && p.longDex.name === r.longDex;
+                            const isWinner = p.shortDex === r.shortDex && p.longDex === r.longDex;
                             return (
                               <div key={pi} style={{
                                 background: isWinner ? T.greenBg : "#f1f5f9",
                                 border: `1px solid ${isWinner ? T.green : T.border}`,
-                                borderRadius: 8, padding: "8px 12px", minWidth: 170,
+                                borderRadius: 8, padding: "8px 12px", minWidth: 190,
                               }}>
                                 <div style={{ fontSize: 11, fontWeight: 700, color: isWinner ? T.green : T.muted }}>
-                                  {p.shortDex.name} SHORT / {p.longDex.name} LONG {isWinner ? "✓ GANADOR" : ""}
+                                  {p.shortDex} → {p.longDex} {isWinner ? "✓ GANADOR" : ""}
                                 </div>
-                                <div style={{ display: "flex", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                                <div style={{ display: "flex", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
                                   <span style={{ fontSize: 10, color: T.muted }}>Score: <b style={{ color: isWinner ? T.green : T.text }}>{p.score}</b></span>
-                                  <span style={{ fontSize: 10, color: T.muted }}>APR: <b>{p.spreadApr.toFixed(1)}%</b></span>
-                                  <span style={{ fontSize: 10, color: T.muted }}>OI: <b>${(p.oi/1000).toFixed(0)}K</b></span>
-                                  <span style={{ fontSize: 10, color: T.muted }}>Vol: <b>${(p.vol/1e6).toFixed(1)}M</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>APR: <b>+{p.avgApr.toFixed(1)}%</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>Pos: <b>{(p.pctPositive * 100).toFixed(0)}%</b></span>
+                                  <span style={{ fontSize: 10, color: T.muted }}>σ: <b>{p.stdDev.toFixed(0)}%</b></span>
                                 </div>
                               </div>
                             );
                           })}
                         </div>
-                        <div style={{ marginTop: 8, fontSize: 11, color: T.muted }}>
-                          Razón de selección: <b style={{ color: T.accent }}>{r.winReason}</b>
-                        </div>
                       </div>
                     )}
-                    <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12, color: T.muted, marginBottom: 16 }}>
-                      <span>Price parity: <b style={{ color: r.priceDiff < 0.5 ? T.green : T.red }}>{r.priceDiff?.toFixed(3)}%</b></span>
-                      <span>Spread mercado: <b>{(r.spreadPct*100).toFixed(3)}%</b></span>
-                      <span>OI: <b>${(r.oi/1000).toFixed(0)}K</b></span>
-                    </div>
+
+                    {/* Gráfico histórico */}
                     <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 16 }}>
-                      <div style={{ color: T.muted, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>FUNDING DELTA (APR) — {r.symbol}</div>
-                      <SpreadChart symbol={r.symbol} shortDex={r.shortDex} longDex={r.longDex}
-                        hlMap={maps.hlMap || {}} asterMap={maps.asterMap || {}} backMap={maps.backMap || {}} />
+                      <div style={{ color: T.muted, fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
+                        FUNDING DELTA (APR) — {r.symbol} · {r.shortDex} SHORT / {r.longDex} LONG
+                      </div>
+                      <div style={{ color: T.subtle, fontSize: 11, marginBottom: 4 }}>
+                        HL histórico vs tasa actual {r.otherDex} ({r.otherFundingApr?.toFixed(2)}% fija como referencia)
+                      </div>
+                      <SpreadChart
+                        symbol={r.symbol}
+                        shortDex={r.shortDex}
+                        otherFundingApr={r.otherFundingApr}
+                      />
                     </div>
                   </div>
                 )}
@@ -544,12 +713,14 @@ export default function RankingTab({ config }) {
           })}
         </div>
       )}
+
       {results.length > 0 && (
         <div style={{ color: T.subtle, fontSize: 12, textAlign: "center" }}>
-          {results.length} tokens · vol ≥ $300K/DEX · Clic en fila para historial
+          {results.length} tokens · score histórico 30d · vol ≥ $300K/DEX · Clic en fila para detalle
         </div>
       )}
 
+      {/* ── Panel de descartados ── */}
       {discarded.length > 0 && (
         <details style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, overflow: "hidden" }}>
           <summary style={{
@@ -558,16 +729,13 @@ export default function RankingTab({ config }) {
             background: "#fff7ed", borderBottom: `1px solid #fed7aa`,
           }}>
             <span style={{ color: "#92400e", fontSize: 12, fontWeight: 700 }}>
-              ❌ {discarded.length} tokens descartados por liquidez insuficiente
+              ❌ {discarded.length} tokens descartados por liquidez o histórico insuficiente
             </span>
             <span style={{ color: "#92400e", fontSize: 11 }}>▼ ver detalle</span>
           </summary>
           <div style={{ padding: "12px 16px", display: "flex", flexWrap: "wrap", gap: 8 }}>
             {discarded.map(d => (
-              <div key={d.symbol} style={{
-                background: "#fff7ed", border: "1px solid #fed7aa",
-                borderRadius: 8, padding: "6px 10px",
-              }}>
+              <div key={d.symbol} style={{ background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 8, padding: "6px 10px" }}>
                 <span style={{ color: T.text, fontSize: 12, fontWeight: 700 }}>{d.symbol}</span>
                 <span style={{ color: "#92400e", fontSize: 11, marginLeft: 6 }}>❌ {d.reason}</span>
               </div>
