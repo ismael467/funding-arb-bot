@@ -14,7 +14,7 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX = 300000;
-const CACHE_KEY  = "fundingArb_ranking30d_v2";
+const CACHE_KEY  = "fundingArb_ranking30d_v3";
 const CACHE_TTL  = 6 * 3600 * 1000;
 const TOP_N      = 20;
 const TIMEFRAMES = ["24h", "3d", "7d", "15d", "31d"];
@@ -322,7 +322,12 @@ export default function RankingTab({ config }) {
               : backMap[r.symbol]?.fundingApr  || 0;
             const currentSpread = r.shortDex === "HL" ? hlApr - othApr : othApr - hlApr;
             return { ...r, hlVol, otherVol, vol: Math.min(hlVol, otherVol), currentSpread, currentHlApr: hlApr, otherFundingApr: othApr };
-          }).filter(r => r.hlVol >= MIN_VOL_PER_DEX && r.otherVol >= MIN_VOL_PER_DEX);
+          }).filter(r => {
+            if (r.hlVol < MIN_VOL_PER_DEX || r.otherVol < MIN_VOL_PER_DEX) return false;
+            // Re-verificar OI de Aster: si ahora es $0, el mercado ya no existe
+            if (r.otherDex === "Aster" && (asterMap[r.symbol]?.oi || 0) === 0) return false;
+            return true;
+          });
 
           setResults(updated.sort((a, b) => b.score - a.score));
           setLastScan(new Date());
@@ -348,17 +353,33 @@ export default function RankingTab({ config }) {
 
         const hlVol = hlMap[sym]?.vol24h || 0;
 
-        // DEX contrapartes con vol suficiente
+        // DEX contrapartes: vol >= MIN y, para Aster, OI > 0 (sin OI real = mercado inexistente)
         const candidates = [];
-        if ((asterMap[sym]?.vol24h || 0) >= MIN_VOL_PER_DEX)  candidates.push({ name: "Aster",    ...asterMap[sym] });
-        if ((backMap[sym]?.vol24h  || 0) >= MIN_VOL_PER_DEX)  candidates.push({ name: "Backpack", ...backMap[sym] });
+        const localDiscards = [];
+
+        if (asterMap[sym]) {
+          const d = asterMap[sym];
+          if (d.vol24h >= MIN_VOL_PER_DEX && d.oi > 0) {
+            candidates.push({ name: "Aster", ...d });
+          } else {
+            const reason = d.oi === 0
+              ? `Sin datos suficientes en Aster (OI = $0)`
+              : `Vol insuf. en Aster ($${(d.vol24h / 1000).toFixed(0)}K)`;
+            localDiscards.push(reason);
+          }
+        }
+        if (backMap[sym]) {
+          const d = backMap[sym];
+          if (d.vol24h >= MIN_VOL_PER_DEX) {
+            candidates.push({ name: "Backpack", ...d });
+          } else {
+            localDiscards.push(`Vol insuf. en Backpack ($${(d.vol24h / 1000).toFixed(0)}K)`);
+          }
+        }
 
         if (candidates.length === 0) {
-          const lowDex = asterMap[sym] ? ["Aster", asterMap[sym]] : backMap[sym] ? ["Backpack", backMap[sym]] : null;
-          if (lowDex) {
-            const [dex, d] = lowDex;
-            discardedList.push({ symbol: sym, reason: `Vol insuf. en ${dex} ($${((d.vol24h || 0) / 1000).toFixed(0)}K)` });
-          }
+          if (localDiscards.length > 0)
+            discardedList.push({ symbol: sym, reason: localDiscards[0] });
           continue;
         }
 
