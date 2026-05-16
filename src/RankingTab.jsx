@@ -4,6 +4,7 @@ const PROXY     = "https://cors-proxy.munichbro69.workers.dev";
 const HL_API    = "https://api.hyperliquid.xyz/info";
 const ASTER_API = "https://fapi.asterdex.com";
 const BACK_API  = "https://api.backpack.exchange/api/v1";
+const DYDX_API  = "https://indexer.dydx.trade"; // CORS libre, sin proxy
 
 const T = {
   bg: "#f0f2f5", card: "#ffffff", border: "#e2e8f0",
@@ -14,8 +15,8 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v6"; // histórico HL — caché 6h
-const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v1";   // tasas Aster/BP — caché 15 min
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v7"; // histórico HL+dYdX — caché 6h
+const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v2";   // tasas Aster/BP/dYdX — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
 const TOP_N               = 20;
@@ -63,6 +64,47 @@ function calcHistoricalMetrics(hlHistory, otherFundingApr) {
   return { avgApr, pctPositive: pctPos, stdDev, stability, consecutiveDays: Math.floor(consec / 3), n, hlIsShort };
 }
 
+// Versión dual: alinea HL (8h) con dYdX (1h) por timestamp más cercano
+// Usa spread real período a período en lugar de tasa actual fija como referencia
+function calcHistoricalMetricsDual(hlHistory, dydxHistory) {
+  if (!hlHistory || hlHistory.length < 5 || !dydxHistory || dydxHistory.length < 5) return null;
+
+  // dYdX rate es por hora → APR = rate * 24 * 365 * 100
+  const dydxSorted = dydxHistory
+    .map(d => ({ ts: new Date(d.effectiveAt).getTime(), apr: parseFloat(d.rate) * 24 * 365 * 100 }))
+    .sort((a, b) => a.ts - b.ts);
+
+  const hlSorted = [...hlHistory].sort((a, b) => a.time - b.time);
+
+  // Two-pointer: para cada HL entry (8h) encontrar el dYdX entry más cercano
+  const pairs = [];
+  let di = 0;
+  for (const h of hlSorted) {
+    const hlTs  = h.time;
+    const hlApr = parseFloat(h.fundingRate) * 3 * 365 * 100;
+    while (di < dydxSorted.length - 1 &&
+      Math.abs(dydxSorted[di + 1].ts - hlTs) <= Math.abs(dydxSorted[di].ts - hlTs)) di++;
+    if (Math.abs(dydxSorted[di].ts - hlTs) > 12 * 3600000) continue; // >12h de diferencia → saltar
+    pairs.push({ hlApr, dydxApr: dydxSorted[di].apr });
+  }
+
+  if (pairs.length < 5) return null;
+
+  const signedSpreads = pairs.map(p => p.hlApr - p.dydxApr);
+  const signedAvg     = signedSpreads.reduce((a, b) => a + b, 0) / pairs.length;
+  const hlIsShort     = signedAvg >= 0;
+  const abs           = signedSpreads.map(v => Math.abs(v));
+  const n             = abs.length;
+  const avgApr        = abs.reduce((a, b) => a + b, 0) / n;
+  const pctPos        = abs.filter(v => v > 0.01).length / n;
+  const stdDev        = Math.sqrt(abs.reduce((a, v) => a + (v - avgApr) ** 2, 0) / n);
+  const stability     = Math.max(0, 1 - stdDev / Math.max(avgApr, 0.001));
+  let consec = 0;
+  for (let i = abs.length - 1; i >= 0; i--) { if (abs[i] > 0.01) consec++; else break; }
+
+  return { avgApr, pctPositive: pctPos, stdDev, stability, consecutiveDays: Math.floor(consec / 3), n, hlIsShort };
+}
+
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
 // Caché de resultados históricos (6h — histórico HL no cambia rápido)
@@ -84,13 +126,13 @@ function loadDexCache() {
   try {
     const raw = localStorage.getItem(CACHE_DEX_RATES_KEY);
     if (!raw) return null;
-    const { ts, asterMap, backMap } = JSON.parse(raw);
+    const { ts, asterMap, backMap, dydxMap } = JSON.parse(raw);
     if (Date.now() - ts > CACHE_DEX_TTL) return null;
-    return { asterMap, backMap, ts };
+    return { asterMap, backMap, dydxMap: dydxMap || {}, ts };
   } catch { return null; }
 }
-function saveDexCache(asterMap, backMap) {
-  try { localStorage.setItem(CACHE_DEX_RATES_KEY, JSON.stringify({ ts: Date.now(), asterMap, backMap })); } catch {}
+function saveDexCache(asterMap, backMap, dydxMap) {
+  try { localStorage.setItem(CACHE_DEX_RATES_KEY, JSON.stringify({ ts: Date.now(), asterMap, backMap, dydxMap })); } catch {}
 }
 
 // ─── Network ─────────────────────────────────────────────────────────────────
@@ -183,6 +225,49 @@ async function fetchBackpack() {
   } catch { return {}; }
 }
 
+async function fetchDydx() {
+  try {
+    const res  = await fetch(`${DYDX_API}/v4/perpetualMarkets`);
+    const data = await res.json();
+    const map  = {};
+    for (const [key, m] of Object.entries(data.markets || {})) {
+      const sym   = key.replace(/-USD$/, "");
+      const price = parseFloat(m.oraclePrice || 0);
+      if (!price) continue;
+      map[sym] = {
+        fundingApr: parseFloat(m.nextFundingRate || 0) * 24 * 365 * 100, // nextFundingRate es por hora
+        price,
+        vol24h: parseFloat(m.volume24H || 0),
+        oi:     parseFloat(m.openInterest || 0) * price,
+      };
+    }
+    return map;
+  } catch { return {}; }
+}
+
+// Histórico dYdX — CORS libre, sin proxy. Pagina con effectiveBeforeOrAt hacia atrás.
+async function fetchDydxHistory(symbol, days) {
+  try {
+    const startTs = Date.now() - days * 86400000;
+    let all = [], cursor = null;
+    for (let page = 0; page < 5; page++) {
+      const url = `${DYDX_API}/v4/historicalFunding/${encodeURIComponent(symbol + "-USD")}?limit=500` +
+        (cursor ? `&effectiveBeforeOrAt=${encodeURIComponent(cursor)}` : "");
+      const res   = await fetch(url);
+      const data  = await res.json();
+      const batch = data?.historicalFunding;
+      if (!Array.isArray(batch) || !batch.length) break;
+      all = all.concat(batch);
+      const oldest = new Date(batch[batch.length - 1].effectiveAt).getTime();
+      if (oldest <= startTs || batch.length < 500) break;
+      cursor = batch[batch.length - 1].effectiveAt;
+    }
+    return all.filter(d => new Date(d.effectiveAt).getTime() >= startTs);
+  } catch { return []; }
+}
+
+function fetchDydxHistory30d(symbol) { return fetchDydxHistory(symbol, 30); }
+
 // Histórico simple para el gráfico de detalle (sin paginación, variable timeframe)
 async function fetchHLHistory(symbol, days) {
   try {
@@ -209,7 +294,7 @@ async function fetchHLHistory30d(symbol) {
 
 // ─── SpreadChart ──────────────────────────────────────────────────────────────
 
-function SpreadChart({ symbol, shortDex, otherFundingApr }) {
+function SpreadChart({ symbol, shortDex, otherFundingApr, otherDex }) {
   const [tf, setTf]           = useState("7d");
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -217,21 +302,39 @@ function SpreadChart({ symbol, shortDex, otherFundingApr }) {
   const load = useCallback((newTf) => {
     setTf(newTf); setLoading(true);
     const days = newTf === "24h" ? 1 : newTf === "3d" ? 3 : newTf === "7d" ? 7 : newTf === "15d" ? 15 : 31;
-    fetchHLHistory(symbol, days).then(data => {
-      const other = otherFundingApr ?? 0;
-      const points = data.map(d => {
-        const hlApr = parseFloat(d.fundingRate) * 3 * 365 * 100;
-        return {
-          ts: d.time,
-          spreadApr: shortDex === "HL" ? hlApr - other : other - hlApr,
-        };
-      }).filter(p => !isNaN(p.spreadApr));
-      setHistory(points);
-      setLoading(false);
-    });
-  }, [symbol, shortDex, otherFundingApr]);
 
-  useEffect(() => { load(tf); }, [symbol, shortDex, otherFundingApr]);
+    if (otherDex === "dYdX") {
+      // Spread real período a período: alinear HL (8h) con dYdX (1h)
+      Promise.all([fetchHLHistory(symbol, days), fetchDydxHistory(symbol, days)]).then(([hlData, dydxData]) => {
+        const dydxSorted = (dydxData || [])
+          .map(d => ({ ts: new Date(d.effectiveAt).getTime(), apr: parseFloat(d.rate) * 24 * 365 * 100 }))
+          .sort((a, b) => a.ts - b.ts);
+        const hlSorted = [...hlData].sort((a, b) => a.time - b.time);
+        const points = [];
+        let di = 0;
+        for (const h of hlSorted) {
+          const hlTs = h.time;
+          while (di < dydxSorted.length - 1 &&
+            Math.abs(dydxSorted[di + 1].ts - hlTs) <= Math.abs(dydxSorted[di].ts - hlTs)) di++;
+          if (Math.abs(dydxSorted[di]?.ts - hlTs) > 12 * 3600000) continue;
+          const hlApr = parseFloat(h.fundingRate) * 3 * 365 * 100;
+          points.push({ ts: hlTs, spreadApr: shortDex === "HL" ? hlApr - dydxSorted[di].apr : dydxSorted[di].apr - hlApr });
+        }
+        setHistory(points); setLoading(false);
+      });
+    } else {
+      fetchHLHistory(symbol, days).then(data => {
+        const other  = otherFundingApr ?? 0;
+        const points = data.map(d => {
+          const hlApr = parseFloat(d.fundingRate) * 3 * 365 * 100;
+          return { ts: d.time, spreadApr: shortDex === "HL" ? hlApr - other : other - hlApr };
+        }).filter(p => !isNaN(p.spreadApr));
+        setHistory(points); setLoading(false);
+      });
+    }
+  }, [symbol, shortDex, otherFundingApr, otherDex]);
+
+  useEffect(() => { load(tf); }, [symbol, shortDex, otherFundingApr, otherDex]);
 
   const W = 580, H = 180;
   const PAD = { top: 12, right: 12, bottom: 28, left: 44 };
@@ -322,24 +425,26 @@ export default function RankingTab({ config }) {
       setProgress({ step: 0, total: 0, current: "Cargando datos HL..." });
       const hlMap = await fetchHL().catch(() => ({}));
 
-      // Aster y Backpack: caché 15 min (tasas cambian, pero no cada segundo)
-      let asterMap, backMap;
+      // Aster, Backpack y dYdX: caché 15 min
+      let asterMap, backMap, dydxMap;
       const dexCached = !forceRefresh ? loadDexCache() : null;
       if (dexCached) {
         asterMap = dexCached.asterMap;
         backMap  = dexCached.backMap;
+        dydxMap  = dexCached.dydxMap;
       } else {
-        setProgress({ step: 0, total: 0, current: "Cargando tasas Aster/Backpack..." });
-        [asterMap, backMap] = await Promise.allSettled([
-          fetchAster(), fetchBackpack(),
+        setProgress({ step: 0, total: 0, current: "Cargando tasas Aster/Backpack/dYdX..." });
+        [asterMap, backMap, dydxMap] = await Promise.allSettled([
+          fetchAster(), fetchBackpack(), fetchDydx(),
         ]).then(r => r.map(x => x.status === "fulfilled" ? x.value : {}));
-        saveDexCache(asterMap, backMap);
+        saveDexCache(asterMap, backMap, dydxMap);
       }
 
       setDexStatus({
         HL:       Object.keys(hlMap).length,
         Aster:    Object.keys(asterMap).length,
         Backpack: Object.keys(backMap).length,
+        dYdX:     Object.keys(dydxMap).length,
       });
 
       // Intentar caché (evita re-descargar 30d de histórico)
@@ -348,21 +453,17 @@ export default function RankingTab({ config }) {
         if (cached) {
           // Actualizar spread hoy y vol actuales sobre el histórico cacheado
           const updated = cached.data.map(r => {
-            const hlVol    = hlMap[r.symbol]?.vol24h   || 0;
-            const otherVol = r.otherDex === "Aster"
-              ? asterMap[r.symbol]?.vol24h || 0
-              : backMap[r.symbol]?.vol24h  || 0;
-            const hlApr  = hlMap[r.symbol]?.fundingApr    || 0;
-            const othApr = r.otherDex === "Aster"
-              ? asterMap[r.symbol]?.fundingApr || 0
-              : backMap[r.symbol]?.fundingApr  || 0;
+            const hlVol    = hlMap[r.symbol]?.vol24h || 0;
+            const otherVol = r.otherDex === "Aster"   ? asterMap[r.symbol]?.vol24h || 0
+                           : r.otherDex === "dYdX"    ? dydxMap[r.symbol]?.vol24h  || 0
+                           :                            backMap[r.symbol]?.vol24h   || 0;
+            const hlApr    = hlMap[r.symbol]?.fundingApr || 0;
+            const othApr   = r.otherDex === "Aster"   ? asterMap[r.symbol]?.fundingApr || 0
+                           : r.otherDex === "dYdX"    ? dydxMap[r.symbol]?.fundingApr  || 0
+                           :                            backMap[r.symbol]?.fundingApr   || 0;
             const currentSpread = r.shortDex === "HL" ? hlApr - othApr : othApr - hlApr;
             return { ...r, hlVol, otherVol, vol: Math.min(hlVol, otherVol), currentSpread, currentHlApr: hlApr, otherFundingApr: othApr };
-          }).filter(r => {
-            if (r.hlVol < MIN_VOL_PER_DEX || r.otherVol < MIN_VOL_PER_DEX) return false;
-            // Aster no expone OI en su API — no filtrar por OI
-            return true;
-          });
+          }).filter(r => r.hlVol >= MIN_VOL_PER_DEX && r.otherVol >= MIN_VOL_PER_DEX);
 
           setResults(updated.sort((a, b) => b.avgApr - a.avgApr));
           setLastScan(new Date());
@@ -410,6 +511,14 @@ export default function RankingTab({ config }) {
             localDiscards.push(`Vol insuf. en Backpack ($${(d.vol24h / 1000).toFixed(0)}K)`);
           }
         }
+        if (dydxMap[sym]) {
+          const d = dydxMap[sym];
+          if (d.vol24h >= MIN_VOL_PER_DEX) {
+            candidates.push({ name: "dYdX", ...d });
+          } else {
+            localDiscards.push(`Vol insuf. en dYdX ($${(d.vol24h / 1000).toFixed(0)}K)`);
+          }
+        }
 
         if (candidates.length === 0) {
           if (localDiscards.length > 0)
@@ -417,20 +526,26 @@ export default function RankingTab({ config }) {
           continue;
         }
 
-        // Fase 1: descarga de histórico 30d de HL (una vez por token)
+        // Fase 1: descarga histórico HL 30d (siempre) + dYdX 30d (solo si es candidato)
         const hlHistory = await fetchHLHistory30d(sym);
         if (hlHistory.length < 10) {
           discardedList.push({ symbol: sym, reason: "Sin histórico HL suficiente" });
           continue;
         }
 
+        const hasDydx = candidates.some(c => c.name === "dYdX");
+        const dydxHistory = hasDydx ? await fetchDydxHistory30d(sym) : [];
+
         // Fase 2: calcular spreads estimados
         setProgress({ step: i + 1, total: top20.length, current: sym, phase: 2 });
 
-        // Evaluar cada par (HL × Aster, HL × Backpack)
+        // Evaluar cada par (HL × Aster, HL × Backpack, HL × dYdX)
         const pairsWithMetrics = [];
         for (const other of candidates) {
-          const metrics = calcHistoricalMetrics(hlHistory, other.fundingApr);
+          // dYdX: spread real período a período usando ambos históricos
+          const metrics = other.name === "dYdX"
+            ? calcHistoricalMetricsDual(hlHistory, dydxHistory)
+            : calcHistoricalMetrics(hlHistory, other.fundingApr);
           if (!metrics) continue;
 
           const shortDex      = metrics.hlIsShort ? "HL" : other.name;
@@ -498,7 +613,7 @@ export default function RankingTab({ config }) {
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <div style={{ color: T.subtle, fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            RANKING HISTÓRICO 30d · HL × ASTER × BACKPACK
+            RANKING HISTÓRICO 30d · HL × ASTER × BACKPACK × dYdX
           </div>
           {lastScan && (
             <div style={{ color: T.subtle, fontSize: 12, marginTop: 4 }}>
@@ -546,8 +661,8 @@ export default function RankingTab({ config }) {
         background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: 10,
         padding: "10px 14px", fontSize: 12, color: "#0369a1",
       }}>
-        APR estimado usando funding histórico HL y funding actual de Aster/Backpack como referencia.
-        El spread real puede variar.
+        APR estimado con histórico real 30d: HL×dYdX usa spread período a período (más preciso).
+        HL×Aster y HL×Backpack usan tasa actual del DEX como referencia fija. El spread real puede variar.
       </div>
 
       {/* ── Error ── */}
@@ -767,12 +882,15 @@ export default function RankingTab({ config }) {
                         FUNDING DELTA (APR) — {r.symbol} · {r.shortDex} SHORT / {r.longDex} LONG
                       </div>
                       <div style={{ color: T.subtle, fontSize: 11, marginBottom: 4 }}>
-                        HL histórico vs tasa actual {r.otherDex} ({r.otherFundingApr?.toFixed(2)}% fija como referencia)
+                        {r.otherDex === "dYdX"
+                          ? `Spread real período a período: HL histórico vs dYdX histórico (${r.n} puntos alineados)`
+                          : `HL histórico vs tasa actual ${r.otherDex} (${r.otherFundingApr?.toFixed(2)}% fija como referencia)`}
                       </div>
                       <SpreadChart
                         symbol={r.symbol}
                         shortDex={r.shortDex}
                         otherFundingApr={r.otherFundingApr}
+                        otherDex={r.otherDex}
                       />
                     </div>
                   </div>
