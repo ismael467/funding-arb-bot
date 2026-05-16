@@ -13,7 +13,7 @@ const T = {
   yellow: "#f59e0b", blue: "#3b82f6", accent: "#6366f1",
 };
 
-const MIN_VOL = 500000;
+const MIN_VOL_PER_DEX = 300000;
 const TIMEFRAMES = ["24h", "3d", "7d", "15d", "31d"];
 
 function getCls(score) {
@@ -41,6 +41,19 @@ function generatePairs(available) {
       const a = available[i], b = available[j];
       const shortDex = a.fundingApr >= b.fundingApr ? a : b;
       const longDex  = a.fundingApr >= b.fundingApr ? b : a;
+
+      // Per-DEX vol check: $0 or below MIN_VOL_PER_DEX → discard with reason
+      const lowVolDex = shortDex.vol24h === 0 ? shortDex
+        : longDex.vol24h === 0 ? longDex
+        : shortDex.vol24h < MIN_VOL_PER_DEX ? shortDex
+        : longDex.vol24h < MIN_VOL_PER_DEX ? longDex
+        : null;
+      if (lowVolDex) {
+        const volStr = lowVolDex.vol24h === 0 ? "$0" : `$${(lowVolDex.vol24h / 1000).toFixed(0)}K`;
+        pairs.push({ shortDex, longDex, discardReason: `Vol insuficiente en ${lowVolDex.name} (${volStr})` });
+        continue;
+      }
+
       const spreadApr = shortDex.fundingApr - longDex.fundingApr;
       if (spreadApr < 1) continue;
       const priceDiff = shortDex.price > 0 && longDex.price > 0
@@ -50,7 +63,7 @@ function generatePairs(available) {
       const spreadPct = Math.max(shortDex.spreadPct || 0, longDex.spreadPct || 0);
       const oi = Math.min(shortDex.oi || 0, longDex.oi || 0);
       const score = calcScore({ spreadApr, spreadPct, vol, oi });
-      pairs.push({ shortDex, longDex, spreadApr, priceDiff, vol, spreadPct, oi, score });
+      pairs.push({ shortDex, longDex, spreadApr, priceDiff, vol, spreadPct, oi, score, discardReason: null });
     }
   }
   return pairs;
@@ -291,6 +304,7 @@ export default function RankingTab({ config }) {
   const [dexStatus, setDexStatus] = useState({});
   const [maps, setMaps]           = useState({});
   const [debugInfo, setDebugInfo] = useState("");
+  const [discarded, setDiscarded] = useState([]);
 
   const runScan = useCallback(async () => {
     setLoading(true); setError(null); setSelected(null); setDebugInfo("");
@@ -319,6 +333,7 @@ export default function RankingTab({ config }) {
       ];
 
       const results = [];
+      const discardedList = [];
       let filteredByVol = 0;
 
       for (const sym of Object.keys(hlMap)) {
@@ -328,10 +343,18 @@ export default function RankingTab({ config }) {
         if (available.length < 2) continue;
 
         const pairs = generatePairs(available);
-        if (pairs.length === 0) continue;
+        const validPairs    = pairs.filter(p => !p.discardReason && p.score !== undefined);
+        const rejectedPairs = pairs.filter(p => p.discardReason);
 
-        const validPairs = pairs.filter(p => p.vol >= MIN_VOL);
-        if (validPairs.length === 0) { filteredByVol++; continue; }
+        if (validPairs.length === 0) {
+          filteredByVol++;
+          if (rejectedPairs.length > 0) {
+            const reason = rejectedPairs.find(p => p.discardReason.includes("$0"))?.discardReason
+              || rejectedPairs[0].discardReason;
+            discardedList.push({ symbol: sym, reason });
+          }
+          continue;
+        }
 
         const winner = validPairs.reduce((best, p) => p.score > best.score ? p : best, validPairs[0]);
         const winReason = getWinReason(winner, validPairs);
@@ -350,6 +373,7 @@ export default function RankingTab({ config }) {
         });
       }
 
+      setDiscarded(discardedList.sort((a, b) => a.symbol.localeCompare(b.symbol)));
       setDebugInfo(prev => `${prev} | Filtrados por vol: ${filteredByVol} | Resultado: ${results.length}`);
       setResults(results.sort((a, b) => b.score - a.score));
       setLastScan(new Date());
@@ -365,7 +389,7 @@ export default function RankingTab({ config }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <div style={{ color: T.subtle, fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            RANKING · HL × ASTER × BACKPACK · VOL MÍN $500K
+            RANKING · HL × ASTER × BACKPACK · VOL MÍN $300K/DEX
           </div>
           {lastScan && (
             <div style={{ color: T.subtle, fontSize: 12, marginTop: 4 }}>
@@ -396,14 +420,14 @@ export default function RankingTab({ config }) {
       {loading && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
           <div style={{ color: T.accent, fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Escaneando DEX...</div>
-          <div style={{ color: T.subtle, fontSize: 13 }}>HL · Aster · Backpack · Filtrando vol &gt; $500K</div>
+          <div style={{ color: T.subtle, fontSize: 13 }}>HL · Aster · Backpack · Filtrando vol ≥ $300K/DEX</div>
         </div>
       )}
 
       {!loading && results.length === 0 && !error && lastScan && (
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 40, textAlign: "center" }}>
           <div style={{ fontSize: 28, marginBottom: 12 }}>🔍</div>
-          <div style={{ color: T.muted, fontSize: 15 }}>Sin oportunidades con vol &gt; $500K ahora mismo</div>
+          <div style={{ color: T.muted, fontSize: 15 }}>Sin oportunidades con vol ≥ $300K/DEX ahora mismo</div>
           <div style={{ color: T.subtle, fontSize: 13, marginTop: 6 }}>{debugInfo}</div>
         </div>
       )}
@@ -412,7 +436,7 @@ export default function RankingTab({ config }) {
         <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 60, textAlign: "center" }}>
           <div style={{ fontSize: 32, marginBottom: 12 }}>🔍</div>
           <div style={{ color: T.muted, fontSize: 15 }}>Pulsa "Escanear ahora"</div>
-          <div style={{ color: T.subtle, fontSize: 13, marginTop: 6 }}>Solo muestra tokens con vol &gt; $500K en ambos DEX</div>
+          <div style={{ color: T.subtle, fontSize: 13, marginTop: 6 }}>Solo muestra tokens con vol ≥ $300K en cada DEX del par</div>
         </div>
       )}
 
@@ -522,8 +546,34 @@ export default function RankingTab({ config }) {
       )}
       {results.length > 0 && (
         <div style={{ color: T.subtle, fontSize: 12, textAlign: "center" }}>
-          {results.length} tokens · vol &gt; $500K en ambos DEX · Clic en fila para historial
+          {results.length} tokens · vol ≥ $300K/DEX · Clic en fila para historial
         </div>
+      )}
+
+      {discarded.length > 0 && (
+        <details style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, overflow: "hidden" }}>
+          <summary style={{
+            padding: "12px 16px", cursor: "pointer", listStyle: "none",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            background: "#fff7ed", borderBottom: `1px solid #fed7aa`,
+          }}>
+            <span style={{ color: "#92400e", fontSize: 12, fontWeight: 700 }}>
+              ❌ {discarded.length} tokens descartados por liquidez insuficiente
+            </span>
+            <span style={{ color: "#92400e", fontSize: 11 }}>▼ ver detalle</span>
+          </summary>
+          <div style={{ padding: "12px 16px", display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {discarded.map(d => (
+              <div key={d.symbol} style={{
+                background: "#fff7ed", border: "1px solid #fed7aa",
+                borderRadius: 8, padding: "6px 10px",
+              }}>
+                <span style={{ color: T.text, fontSize: 12, fontWeight: 700 }}>{d.symbol}</span>
+                <span style={{ color: "#92400e", fontSize: 11, marginLeft: 6 }}>❌ {d.reason}</span>
+              </div>
+            ))}
+          </div>
+        </details>
       )}
     </div>
   );
