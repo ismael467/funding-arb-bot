@@ -15,7 +15,7 @@ const T = {
 };
 
 const MIN_VOL_PER_DEX     = 300000;
-const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v8"; // histórico HL+dYdX+Aster — caché 6h
+const CACHE_RESULTS_KEY   = "fundingArb_ranking30d_v9"; // histórico HL+dYdX+Aster — caché 6h
 const CACHE_DEX_RATES_KEY = "fundingArb_dexRates_v2";   // tasas Aster/BP/dYdX — caché 15 min
 const CACHE_TTL           = 6 * 3600 * 1000;
 const CACHE_DEX_TTL       = 15 * 60 * 1000;
@@ -528,8 +528,14 @@ export default function RankingTab({ config }) {
         .slice(0, TOP_N)
         .map(([sym]) => sym);
       for (const sym of PRIORITY_TOKENS) {
-        if (hlMap[sym] && !top20.includes(sym)) top20.push(sym);
+        if (hlMap[sym] && !top20.includes(sym)) {
+          top20.push(sym);
+          console.log(`[scan] Token prioritario añadido: ${sym} (HL vol: $${(hlMap[sym].vol24h/1e6).toFixed(1)}M)`);
+        } else if (!hlMap[sym]) {
+          console.warn(`[scan] Token prioritario ${sym} NO encontrado en HL — no se escaneará`);
+        }
       }
+      console.log(`[scan] === Tokens a escanear (${top20.length}): ${top20.join(", ")} ===`);
 
       setProgress({ step: 0, total: top20.length, current: "" });
 
