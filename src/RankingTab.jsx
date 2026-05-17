@@ -110,51 +110,63 @@ async function fetchDydx() {
   } catch { return {}; }
 }
 
-// Aster comparison API — devuelve TODOS los tokens×períodos en una sola respuesta plana.
-// El param ?period= no filtra — se agrupa client-side.
-// Soporta paginación estilo bapi (pageNum/pageSize).
+// Aster comparison API — todos los tokens×períodos en una respuesta plana con paginación.
 // Devuelve: { WLFI: { "1D": item, "1M": item, "1Y": item }, ... }
 async function fetchAsterComp() {
   const TARGET_PERIODS = new Set(["1D", "1M", "1Y"]);
 
+  // Soporta múltiples estructuras de respuesta bapi
   const extractItems = json => {
-    if (Array.isArray(json))                                return json;
-    if (Array.isArray(json?.data))                          return json.data;
-    if (Array.isArray(json?.data?.rows))                    return json.data.rows;
-    if (Array.isArray(json?.rows))                          return json.rows;
-    if (Array.isArray(json?.result))                        return json.result;
+    if (Array.isArray(json))                    return json;
+    if (Array.isArray(json?.data))              return json.data;
+    if (Array.isArray(json?.data?.rows))        return json.data.rows;
+    if (Array.isArray(json?.data?.list))        return json.data.list;
+    if (Array.isArray(json?.rows))              return json.rows;
+    if (Array.isArray(json?.list))              return json.list;
+    if (Array.isArray(json?.result))            return json.result;
     return [];
   };
   const extractTotal = json =>
-    json?.data?.total ?? json?.total ?? json?.data?.count ?? 0;
+    json?.data?.total ?? json?.data?.count ?? json?.total ?? json?.count ?? 0;
 
-  // Primer fetch sin params para detectar estructura y paginación
+  // Fetch directo con fallback a proxy CORS
+  const doFetch = async url => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch {
+      return proxyGet(url); // fallback proxy
+    }
+  };
+
   let firstJson;
   try {
-    firstJson = await fetch(ASTER_COMP_URL).then(r => r.json());
+    firstJson = await doFetch(ASTER_COMP_URL);
   } catch (e) {
-    console.error("[AsterComp] fetch error:", e.message);
+    console.error("[AsterComp] error fetch inicial:", e.message);
     return {};
   }
 
-  console.log("[AsterComp] raw response (600 chars):", JSON.stringify(firstJson).slice(0, 600));
+  // Log diagnóstico completo de la estructura raíz
+  console.log("[AsterComp] claves raíz:", Object.keys(firstJson ?? {}));
+  console.log("[AsterComp] raw (800 chars):", JSON.stringify(firstJson).slice(0, 800));
 
   const firstBatch = extractItems(firstJson);
   const total      = extractTotal(firstJson);
   console.log(`[AsterComp] primer batch: ${firstBatch.length} items, total declarado: ${total}`);
-  if (firstBatch[0]) console.log("[AsterComp] primer item:", JSON.stringify(firstBatch[0]).slice(0, 300));
+  if (firstBatch[0]) console.log("[AsterComp] primer item:", JSON.stringify(firstBatch[0]).slice(0, 400));
 
   const allItems = [...firstBatch];
 
-  // Paginar si hay más páginas (pageSize = lo que devolvió la primera página)
-  const pageSize = firstBatch.length || 100;
-  if (total > pageSize && pageSize > 0) {
-    const pages = Math.ceil(total / pageSize);
-    console.log(`[AsterComp] paginando: ${pages} páginas de ${pageSize}`);
+  // Paginación si la API declara más registros
+  if (total > firstBatch.length && firstBatch.length > 0) {
+    const pageSize = firstBatch.length;
+    const pages    = Math.ceil(total / pageSize);
+    console.log(`[AsterComp] paginando ${pages} páginas × ${pageSize}`);
     for (let page = 2; page <= pages; page++) {
       try {
-        const res = await fetch(`${ASTER_COMP_URL}?pageNum=${page}&pageSize=${pageSize}`)
-          .then(r => r.json());
+        const res = await doFetch(`${ASTER_COMP_URL}?pageNum=${page}&pageSize=${pageSize}`);
         allItems.push(...extractItems(res));
       } catch (e) {
         console.warn(`[AsterComp] error página ${page}:`, e.message);
@@ -163,7 +175,7 @@ async function fetchAsterComp() {
     }
   }
 
-  console.log(`[AsterComp] total items descargados: ${allItems.length}`);
+  console.log(`[AsterComp] total items: ${allItems.length}`);
 
   // Agrupar por símbolo y período (solo 1D, 1M, 1Y)
   const bySymbol = {};
