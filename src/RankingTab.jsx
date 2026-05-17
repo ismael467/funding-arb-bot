@@ -117,6 +117,7 @@ async function fetchAsterComp() {
 
   // Soporta múltiples estructuras de respuesta bapi
   const extractItems = json => {
+    if (Array.isArray(json?.data?.details))     return json.data.details;
     if (Array.isArray(json))                    return json;
     if (Array.isArray(json?.data))              return json.data;
     if (Array.isArray(json?.data?.rows))        return json.data.rows;
