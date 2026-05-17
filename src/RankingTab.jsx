@@ -117,27 +117,42 @@ async function fetchAsterComp() {
   const extract = json => {
     if (Array.isArray(json)) return json;
     if (json?.data && Array.isArray(json.data)) return json.data;
+    if (json?.result && Array.isArray(json.result)) return json.result;
     return [];
   };
+
   const responses = await Promise.all(
     periods.map(p =>
       fetch(`${ASTER_COMP_URL}?period=${p}`)
         .then(r => r.json())
-        .catch(() => [])
+        .catch(e => { console.error(`[AsterComp] fetch ${p} error:`, e.message); return []; })
     )
   );
+
+  // Diagnóstico: loguear JSON crudo y primer item de cada período
+  periods.forEach((period, idx) => {
+    const raw   = responses[idx];
+    const items = extract(raw);
+    console.log(`[AsterComp] raw ${period} (primeros 500 chars):`, JSON.stringify(raw).slice(0, 500));
+    console.log(`[AsterComp] ${period} → ${items.length} items, primer item:`, JSON.stringify(items[0]).slice(0, 300));
+  });
+
   const bySymbol = {};
   periods.forEach((period, idx) => {
-    extract(responses[idx])
-      .filter(i => !i.period || i.period === period)
-      .forEach(item => {
-        if (!item?.pair) return;
-        const sym = item.pair.replace(/USDT$/, "").replace(/BUSD$/, "");
-        if (!bySymbol[sym]) bySymbol[sym] = {};
-        bySymbol[sym][period] = item;
-      });
+    const items = extract(responses[idx]);
+    items.forEach(item => {
+      if (!item?.pair) return;
+      // Aceptar si no hay campo period, o si coincide case-insensitive
+      const itemPeriod = (item.period || "").toUpperCase();
+      if (itemPeriod && itemPeriod !== period) return;
+      const sym = item.pair.replace(/USDT$/, "").replace(/BUSD$/, "");
+      if (!bySymbol[sym]) bySymbol[sym] = {};
+      bySymbol[sym][period] = item;
+    });
   });
-  console.log(`[AsterComp] ${Object.keys(bySymbol).length} tokens (1D+1M+1Y)`);
+
+  console.log(`[AsterComp] resultado final: ${Object.keys(bySymbol).length} tokens`);
+  console.log(`[AsterComp] WLFI:`, JSON.stringify(bySymbol["WLFI"]));
   return bySymbol;
 }
 
