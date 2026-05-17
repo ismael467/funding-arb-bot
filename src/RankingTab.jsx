@@ -110,49 +110,73 @@ async function fetchDydx() {
   } catch { return {}; }
 }
 
-// Aster comparison API — fetch 1D, 1M, 1Y en paralelo (CORS libre)
+// Aster comparison API — devuelve TODOS los tokens×períodos en una sola respuesta plana.
+// El param ?period= no filtra — se agrupa client-side.
+// Soporta paginación estilo bapi (pageNum/pageSize).
 // Devuelve: { WLFI: { "1D": item, "1M": item, "1Y": item }, ... }
 async function fetchAsterComp() {
-  const periods = ["1D", "1M", "1Y"];
-  const extract = json => {
-    if (Array.isArray(json)) return json;
-    if (json?.data && Array.isArray(json.data)) return json.data;
-    if (json?.result && Array.isArray(json.result)) return json.result;
+  const TARGET_PERIODS = new Set(["1D", "1M", "1Y"]);
+
+  const extractItems = json => {
+    if (Array.isArray(json))                                return json;
+    if (Array.isArray(json?.data))                          return json.data;
+    if (Array.isArray(json?.data?.rows))                    return json.data.rows;
+    if (Array.isArray(json?.rows))                          return json.rows;
+    if (Array.isArray(json?.result))                        return json.result;
     return [];
   };
+  const extractTotal = json =>
+    json?.data?.total ?? json?.total ?? json?.data?.count ?? 0;
 
-  const responses = await Promise.all(
-    periods.map(p =>
-      fetch(`${ASTER_COMP_URL}?period=${p}`)
-        .then(r => r.json())
-        .catch(e => { console.error(`[AsterComp] fetch ${p} error:`, e.message); return []; })
-    )
-  );
+  // Primer fetch sin params para detectar estructura y paginación
+  let firstJson;
+  try {
+    firstJson = await fetch(ASTER_COMP_URL).then(r => r.json());
+  } catch (e) {
+    console.error("[AsterComp] fetch error:", e.message);
+    return {};
+  }
 
-  // Diagnóstico: loguear JSON crudo y primer item de cada período
-  periods.forEach((period, idx) => {
-    const raw   = responses[idx];
-    const items = extract(raw);
-    console.log(`[AsterComp] raw ${period} (primeros 500 chars):`, JSON.stringify(raw).slice(0, 500));
-    console.log(`[AsterComp] ${period} → ${items.length} items, primer item:`, JSON.stringify(items[0]).slice(0, 300));
-  });
+  console.log("[AsterComp] raw response (600 chars):", JSON.stringify(firstJson).slice(0, 600));
 
+  const firstBatch = extractItems(firstJson);
+  const total      = extractTotal(firstJson);
+  console.log(`[AsterComp] primer batch: ${firstBatch.length} items, total declarado: ${total}`);
+  if (firstBatch[0]) console.log("[AsterComp] primer item:", JSON.stringify(firstBatch[0]).slice(0, 300));
+
+  const allItems = [...firstBatch];
+
+  // Paginar si hay más páginas (pageSize = lo que devolvió la primera página)
+  const pageSize = firstBatch.length || 100;
+  if (total > pageSize && pageSize > 0) {
+    const pages = Math.ceil(total / pageSize);
+    console.log(`[AsterComp] paginando: ${pages} páginas de ${pageSize}`);
+    for (let page = 2; page <= pages; page++) {
+      try {
+        const res = await fetch(`${ASTER_COMP_URL}?pageNum=${page}&pageSize=${pageSize}`)
+          .then(r => r.json());
+        allItems.push(...extractItems(res));
+      } catch (e) {
+        console.warn(`[AsterComp] error página ${page}:`, e.message);
+        break;
+      }
+    }
+  }
+
+  console.log(`[AsterComp] total items descargados: ${allItems.length}`);
+
+  // Agrupar por símbolo y período (solo 1D, 1M, 1Y)
   const bySymbol = {};
-  periods.forEach((period, idx) => {
-    const items = extract(responses[idx]);
-    items.forEach(item => {
-      if (!item?.pair) return;
-      // Aceptar si no hay campo period, o si coincide case-insensitive
-      const itemPeriod = (item.period || "").toUpperCase();
-      if (itemPeriod && itemPeriod !== period) return;
-      const sym = item.pair.replace(/USDT$/, "").replace(/BUSD$/, "");
-      if (!bySymbol[sym]) bySymbol[sym] = {};
-      bySymbol[sym][period] = item;
-    });
-  });
+  for (const item of allItems) {
+    if (!item?.pair || !item.period) continue;
+    if (!TARGET_PERIODS.has(item.period)) continue;
+    const sym = item.pair.replace(/USDT$/, "").replace(/BUSD$/, "");
+    if (!bySymbol[sym]) bySymbol[sym] = {};
+    bySymbol[sym][item.period] = item;
+  }
 
-  console.log(`[AsterComp] resultado final: ${Object.keys(bySymbol).length} tokens`);
-  console.log(`[AsterComp] WLFI:`, JSON.stringify(bySymbol["WLFI"]));
+  console.log(`[AsterComp] ${Object.keys(bySymbol).length} tokens con 1D/1M/1Y`);
+  console.log("[AsterComp] WLFI:", JSON.stringify(bySymbol["WLFI"] ?? "NO ENCONTRADO"));
   return bySymbol;
 }
 
