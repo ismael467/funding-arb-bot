@@ -5,11 +5,14 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview --port $PORT --host"
+    "preview": "vite preview --port $PORT --host",
+    "start": "node server.js"
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",

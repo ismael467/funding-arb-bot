@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: funding-arb-logger
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
